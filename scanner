@@ -1,22 +1,35 @@
 import frida
 import time
 import json
-import keyboard  # for global hotkeys, so Endless can stay focused
+import ctypes
+import ctypes.wintypes as wintypes
 
-# ------------ Config ------------
-WALK_ADDRESS = "0xEEC70"   # walk function RVA from Endless.exe (from your script)
+# ============================
+# CONFIG
+# ============================
+
+WALK_ADDRESS = "0xEEC70"   # walk function RVA from Endless.exe (your script)
 PRE_BYTES = 0x200          # bytes before X address to include in scan window
 SCAN_RANGE = 0x400         # total scan window size in bytes
 
-# Hotkeys to trigger scans while EO window is focused
-HOTKEYS = {
-    "up": "f9",
-    "down": "f10",
-    "left": "f11",
-    "right": "f12",
+# Hotkey IDs (arbitrary, just must be unique in this process)
+HK_UP = 1
+HK_DOWN = 2
+HK_LEFT = 3
+HK_RIGHT = 4
+
+# Map directions to hotkey IDs and F-keys
+DIR_TO_HK = {
+    "up":    (HK_UP,    "F9"),
+    "down":  (HK_DOWN,  "F10"),
+    "left":  (HK_LEFT,  "F11"),
+    "right": (HK_RIGHT, "F12"),
 }
 
-# ------------ Globals ------------
+# ============================
+# GLOBAL STATE
+# ============================
+
 x_address = None
 y_address = None
 xstarted = 0
@@ -27,11 +40,56 @@ xy_script = None
 scan_session = None
 scan_script = None
 
-# store offsets (not absolute) while scanning; we convert to addresses at the end
+# store offsets (ints relative to base window); we turn these into absolute
 offset_results = {"up": [], "down": [], "left": [], "right": []}
 
+# ============================
+# WINDOWS HOTKEY SETUP (WM_HOTKEY)
+# ============================
 
-# ------------ XY resolver (Frida hook, same pattern as your bot) ------------
+user32 = ctypes.windll.user32
+WM_HOTKEY = 0x0312
+
+# Register F9–F12 as global hotkeys (no admin required)
+# F9  = 0x78
+# F10 = 0x79
+# F11 = 0x7A
+# F12 = 0x7B
+user32.RegisterHotKey(None, HK_UP,    0, 0x78)  # F9
+user32.RegisterHotKey(None, HK_DOWN,  0, 0x79)  # F10
+user32.RegisterHotKey(None, HK_LEFT,  0, 0x7A)  # F11
+user32.RegisterHotKey(None, HK_RIGHT, 0, 0x7B)  # F12
+
+
+def wait_for_hotkey(expected_id: int):
+    """
+    Block until the WM_HOTKEY with the given ID (wParam) is received.
+    Works even if the console is minimized and Endless.exe is focused.
+    """
+    msg = wintypes.MSG()
+    while True:
+        # GetMessage blocks until a message is available.
+        # Return value:
+        #   >0 : message retrieved
+        #    0 : WM_QUIT
+        #   -1 : error
+        ret = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+        if ret == -1:
+            # Error, just continue looping
+            continue
+
+        if msg.message == WM_HOTKEY and msg.wParam == expected_id:
+            # This is the hotkey we were waiting for
+            return
+
+        # For other messages, just do normal translation/dispatch
+        user32.TranslateMessage(ctypes.byref(msg))
+        user32.DispatchMessageW(ctypes.byref(msg))
+
+
+# ============================
+# XY RESOLVER (Frida hook, same pattern as your bot)
+# ============================
 
 def on_message_xy(message, data):
     """
@@ -122,7 +180,9 @@ def start_frida_session_xy(walk_address: str):
     print("[xy] X/Y resolved.")
 
 
-# ------------ Memory scanner (Frida RPC) ------------
+# ============================
+# MEMORY SCANNER (Frida RPC)
+# ============================
 
 SCAN_JS_TEMPLATE = """
 var xPtr = ptr("%s");
@@ -178,27 +238,30 @@ def start_scanner_session():
     print("[scan] Scanner script loaded.")
 
     # ask user to stand still, then capture baseline
-    print("\n[scan] Stand still in-game (no movement).")
-    input("[scan] When you are idle, press Enter here to capture baseline...")
+    print("\n[scan] Stand still in-game (no movement at all).")
+    input("[scan] When you are idle, press Enter HERE to capture baseline...")
     scan_script.exports.resetbaseline()
     print("[scan] Idle baseline captured.")
 
 
-def scan_direction(direction: str, hotkey: str):
+def scan_direction(direction: str):
     """
-    One pass: user focuses Endless Online, holds the arrow key,
-    and presses the given HOTKEY (F9/F10/F11/F12). We diff the memory
-    against the idle baseline and record the offsets that changed.
+    One pass: user focuses Endless Online, holds the arrow key for this
+    direction, and presses the global hotkey (F9/F10/F11/F12).
+    We diff the memory window vs the idle baseline and record the offsets.
     """
-    print(f"\n[scan] >>> {direction.upper()} SCAN")
-    print(f"[scan] 1) Focus Endless Online window.")
-    print(f"[scan] 2) HOLD the {direction.upper()} ARROW key.")
-    print(f"[scan] 3) While still holding that arrow, press {hotkey.upper()} once.")
-    print(f"[scan] Waiting for {hotkey.upper()}...")
+    hk_id, hk_name = DIR_TO_HK[direction]
 
-    # Wait for global hotkey while EO stays focused
-    keyboard.wait(hotkey)
-    # small delay to ensure arrow is being held and memory is in 'moving' state
+    print(f"\n[scan] >>> {direction.upper()} SCAN")
+    print("[scan] 1) Focus Endless Online window.")
+    print(f"[scan] 2) HOLD the {direction.upper()} ARROW key (keep it held).")
+    print(f"[scan] 3) While still holding it, press {hk_name} once.")
+    print(f"[scan] Waiting for {hk_name} hotkey...")
+
+    # Wait for the correct WM_HOTKEY to fire
+    wait_for_hotkey(hk_id)
+
+    # small delay to ensure movement is actively happening when we sample
     time.sleep(0.15)
 
     changed = scan_script.exports.diffscan()
@@ -206,7 +269,9 @@ def scan_direction(direction: str, hotkey: str):
     print(f"[scan] {direction.upper()}: {len(changed)} offsets changed vs idle.")
 
 
-# ------------ Filtering helpers ------------
+# ============================
+# FILTERING HELPERS
+# ============================
 
 def compute_absolute_results():
     """
@@ -222,7 +287,7 @@ def compute_absolute_results():
         for d in ("up", "down", "left", "right")
     }
 
-    # raw addresses
+    # raw addresses per direction
     raw_abs = {
         d: [hex(base_start + off) for off in sorted(sets[d])]
         for d in sets
@@ -245,11 +310,14 @@ def compute_absolute_results():
     return raw_abs, unique_abs
 
 
-# ------------ CLI entrypoint ------------
+# ============================
+# MAIN
+# ============================
 
 def main():
-    print("=== EO Movement Flag Scanner (Frida 16, no GUI, hotkey-triggered) ===")
+    print("=== EO Movement Flag Scanner (Frida 16, WM_HOTKEY global F-keys) ===")
     print("Make sure Endless.exe is running and your character is in-game.")
+
     input("Press Enter here once, then switch to Endless and be ready to move...")
 
     start_frida_session_xy(WALK_ADDRESS)
@@ -257,9 +325,9 @@ def main():
 
     start_scanner_session()
 
+    # Run in this fixed order, with clear prompts:
     for direction in ("up", "down", "left", "right"):
-        hotkey = HOTKEYS[direction]
-        scan_direction(direction, hotkey)
+        scan_direction(direction)
 
     raw_abs, unique_abs = compute_absolute_results()
 
@@ -286,6 +354,12 @@ def main():
             xy_session.detach()
         except Exception:
             pass
+
+    # Unregister hotkeys (cleanup)
+    user32.UnregisterHotKey(None, HK_UP)
+    user32.UnregisterHotKey(None, HK_DOWN)
+    user32.UnregisterHotKey(None, HK_LEFT)
+    user32.UnregisterHotKey(None, HK_RIGHT)
 
 
 if __name__ == "__main__":
