@@ -1,11 +1,20 @@
 import frida
 import time
 import json
+import keyboard  # for global hotkeys, so Endless can stay focused
 
 # ------------ Config ------------
-WALK_ADDRESS = "0xEEC70"   # walk function RVA from Endless.exe
+WALK_ADDRESS = "0xEEC70"   # walk function RVA from Endless.exe (from your script)
 PRE_BYTES = 0x200          # bytes before X address to include in scan window
 SCAN_RANGE = 0x400         # total scan window size in bytes
+
+# Hotkeys to trigger scans while EO window is focused
+HOTKEYS = {
+    "up": "f9",
+    "down": "f10",
+    "left": "f11",
+    "right": "f12",
+}
 
 # ------------ Globals ------------
 x_address = None
@@ -18,10 +27,11 @@ xy_script = None
 scan_session = None
 scan_script = None
 
-results = {"up": [], "down": [], "left": [], "right": []}
+# store offsets (not absolute) while scanning; we convert to addresses at the end
+offset_results = {"up": [], "down": [], "left": [], "right": []}
 
 
-# ------------ XY resolver (Frida hook, same pattern as CeraBot) ------------
+# ------------ XY resolver (Frida hook, same pattern as your bot) ------------
 
 def on_message_xy(message, data):
     """
@@ -102,7 +112,8 @@ def start_frida_session_xy(walk_address: str):
     xy_script.on("message", on_message_xy)
     xy_script.load()
 
-    print("[xy] Now move your character once in-game to trigger the walk hook...")
+    print("[xy] Now MOVE your character once in-game to trigger the walk hook "
+          "(keep Endless focused).")
 
     # Block until we have X/Y
     while xstarted == 0:
@@ -126,18 +137,23 @@ function takeSnapshot() {
     return out;
 }
 
-var snapshot = takeSnapshot();
+var baseline = null;
 
 rpc.exports = {
+  resetbaseline: function() {
+    baseline = takeSnapshot();
+  },
   diffscan: function() {
+    if (baseline === null) {
+      baseline = takeSnapshot();
+    }
     var now = takeSnapshot();
     var changed = [];
     for (var i = 0; i < size; i++) {
-      if (now[i] !== snapshot[i]) {
+      if (now[i] !== baseline[i]) {
         changed.push(i);
       }
     }
-    snapshot = now;
     return changed;
   }
 };
@@ -146,9 +162,9 @@ rpc.exports = {
 
 def start_scanner_session():
     """
-    Attach a fresh Frida session that exposes diffscan(), which returns
-    offsets inside [x_address-PRE_BYTES, x_address-PRE_BYTES+SCAN_RANGE)
-    that changed since the last snapshot.
+    Attach a fresh Frida session that exposes:
+      - resetbaseline(): capture idle snapshot
+      - diffscan(): offsets that differ from baseline
     """
     global scan_session, scan_script
 
@@ -159,33 +175,82 @@ def start_scanner_session():
     js = SCAN_JS_TEMPLATE % (hex(x_address), PRE_BYTES, SCAN_RANGE)
     scan_script = scan_session.create_script(js)
     scan_script.load()
-    print("[scan] Scanner script loaded. Baseline snapshot captured.")
+    print("[scan] Scanner script loaded.")
+
+    # ask user to stand still, then capture baseline
+    print("\n[scan] Stand still in-game (no movement).")
+    input("[scan] When you are idle, press Enter here to capture baseline...")
+    scan_script.exports.resetbaseline()
+    print("[scan] Idle baseline captured.")
 
 
-def scan_direction(direction: str):
+def scan_direction(direction: str, hotkey: str):
     """
-    One pass: user holds UP/DOWN/LEFT/RIGHT in EO, we diff the memory
-    window and record all changed absolute addresses for that direction.
+    One pass: user focuses Endless Online, holds the arrow key,
+    and presses the given HOTKEY (F9/F10/F11/F12). We diff the memory
+    against the idle baseline and record the offsets that changed.
     """
-    print(f"\n[scan] >>> Prepare to scan {direction.upper()} movement.")
-    print(f"[scan] Hold the {direction.upper()} key in Endless Online, then press Enter here.")
-    input()
-    time.sleep(0.2)  # small delay to make sure state is 'held'
+    print(f"\n[scan] >>> {direction.upper()} SCAN")
+    print(f"[scan] 1) Focus Endless Online window.")
+    print(f"[scan] 2) HOLD the {direction.upper()} ARROW key.")
+    print(f"[scan] 3) While still holding that arrow, press {hotkey.upper()} once.")
+    print(f"[scan] Waiting for {hotkey.upper()}...")
+
+    # Wait for global hotkey while EO stays focused
+    keyboard.wait(hotkey)
+    # small delay to ensure arrow is being held and memory is in 'moving' state
+    time.sleep(0.15)
 
     changed = scan_script.exports.diffscan()
-    base_start = x_address - PRE_BYTES
-    abs_addrs = [hex(base_start + off) for off in changed]
-    results[direction] = abs_addrs
+    offset_results[direction] = changed
+    print(f"[scan] {direction.upper()}: {len(changed)} offsets changed vs idle.")
 
-    print(f"[scan] {direction.upper()}: {len(abs_addrs)} changed addresses recorded.")
+
+# ------------ Filtering helpers ------------
+
+def compute_absolute_results():
+    """
+    Convert offset_results into:
+      - raw absolute addresses
+      - unique absolute addresses (best guesses)
+    """
+    base_start = x_address - PRE_BYTES
+
+    # Convert offsets to sets for filtering
+    sets = {
+        d: set(offset_results.get(d, []))
+        for d in ("up", "down", "left", "right")
+    }
+
+    # raw addresses
+    raw_abs = {
+        d: [hex(base_start + off) for off in sorted(sets[d])]
+        for d in sets
+    }
+
+    # unique per-direction: changed for that direction, not for the others
+    unique_offsets = {}
+    for d in sets:
+        other_dirs = [od for od in sets.keys() if od != d]
+        others_union = set()
+        for od in other_dirs:
+            others_union |= sets[od]
+        unique_offsets[d] = sets[d] - others_union
+
+    unique_abs = {
+        d: [hex(base_start + off) for off in sorted(unique_offsets[d])]
+        for d in unique_offsets
+    }
+
+    return raw_abs, unique_abs
 
 
 # ------------ CLI entrypoint ------------
 
 def main():
-    print("=== EO Movement Flag Scanner (Frida 16, no GUI) ===")
+    print("=== EO Movement Flag Scanner (Frida 16, no GUI, hotkey-triggered) ===")
     print("Make sure Endless.exe is running and your character is in-game.")
-    input("Press Enter to attach and resolve X/Y using walkAddress hook...")
+    input("Press Enter here once, then switch to Endless and be ready to move...")
 
     start_frida_session_xy(WALK_ADDRESS)
     print(f"[main] Using resolved X={hex(x_address)}, Y={hex(y_address)}")
@@ -193,14 +258,22 @@ def main():
     start_scanner_session()
 
     for direction in ("up", "down", "left", "right"):
-        scan_direction(direction)
+        hotkey = HOTKEYS[direction]
+        scan_direction(direction, hotkey)
+
+    raw_abs, unique_abs = compute_absolute_results()
+
+    data = {
+        "raw": raw_abs,
+        "unique": unique_abs
+    }
 
     filename = "movement_addresses.json"
     with open(filename, "w", encoding="utf-8") as f:
-        json.dump(results, f, indent=4)
+        json.dump(data, f, indent=4)
 
-    print(f"\n[done] Saved absolute movement addresses to {filename}")
-    print(json.dumps(results, indent=4))
+    print(f"\n[done] Saved movement addresses to {filename}")
+    print(json.dumps(data, indent=4))
 
     # Clean up sessions
     if scan_session is not None:
