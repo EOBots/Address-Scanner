@@ -1,64 +1,127 @@
 import frida
 import time
 import json
-import tkinter as tk
-from tkinter import messagebox, scrolledtext, filedialog
 
-# ============================
-# CONFIG (from your script)
-# ============================
+# ------------ Config ------------
+WALK_ADDRESS = "0xEEC70"   # walk function RVA from Endless.exe
+PRE_BYTES = 0x200          # bytes before X address to include in scan window
+SCAN_RANGE = 0x400         # total scan window size in bytes
 
-WALK_ADDRESS = "0xEEC70"   # walk function address to hook like CeraBot
-SCAN_RANGE = 0x400         # bytes around X/Y to scan
-PRE_BYTES = 0x200          # how far before X to scan
-
-# ============================
-# INTERNAL STATE
-# ============================
+# ------------ Globals ------------
 x_address = None
 y_address = None
-baseline = {}
+xstarted = 0
+
+xy_session = None
+xy_script = None
+
+scan_session = None
+scan_script = None
+
 results = {"up": [], "down": [], "left": [], "right": []}
 
-session = None
-script = None
 
-# ============================
-# HOOK TO DISCOVER X/Y (same as CeraBot)
-# ============================
+# ------------ XY resolver (Frida hook, same pattern as CeraBot) ------------
 
-XY_HOOK_JS = """
-var base = Process.getModuleByName("Endless.exe").base;
-var rel = ptr(%d);
-var target = base.add(rel);
+def on_message_xy(message, data):
+    """
+    Frida message handler to capture dynamic X/Y addresses when the walk
+    function executes once.
+    """
+    global xstarted, x_address, y_address, xy_session
 
-Interceptor.attach(target, {
-    onEnter: function(args) {
+    if message["type"] == "send":
+        payload = message["payload"]
+        if "error" in payload:
+            print("[frida][xy] error from script:", payload["error"])
+            return
+
+        x_address = int(payload["x_address"], 16)
+        y_address = int(payload["y_address"], 16)
+        print(f"[frida][xy] X={hex(x_address)}, Y={hex(y_address)}")
+
+        xstarted = 1
+
+        # Detach this session once we have X/Y, no need to keep hook active
+        try:
+            xy_session.detach()
+        except Exception:
+            pass
+
+    elif message["type"] == "error":
+        print("[frida][xy] script error:", message.get("stack", message))
+
+
+def start_frida_session_xy(walk_address: str):
+    """
+    Attach to Endless.exe and hook the walk function at WALK_ADDRESS
+    to resolve the dynamic X/Y addresses (same logic as CeraBot v12.2/v13).
+    """
+    global xy_session, xy_script, xstarted
+
+    xstarted = 0
+    xy_session = frida.attach("Endless.exe")
+    print("[xy] Attached to Endless.exe, waiting for movement hook...")
+
+    # Inline JS, using the same safe pattern as your bot:
+    script_code = f"""
+    var mod = null;
+    try {{
+      mod = Process.getModuleByName("Endless.exe");
+    }} catch (e) {{
+      var mods = Process.enumerateModules();
+      mod = mods.length ? mods[0] : null;
+    }}
+
+    if (!mod) {{
+      throw new Error("Could not find module base for Endless.exe");
+    }}
+
+    var base = mod.base;
+    var rel  = ptr({int(walk_address, 16)});
+    var target = base.add(rel);
+
+    Interceptor.attach(target, {{
+      onEnter: function(args) {{
         var reg = this.context.ecx || this.context.rcx;
-        if (!reg) return;
-        var xAddr = reg.add(0x08);
-        var yAddr = xAddr.add(0x04);
-        send({ x_addr: xAddr.toString(), y_addr: yAddr.toString() });
-    }
-});
-""" % int(WALK_ADDRESS, 16)
+        if (!reg) {{
+          send({{ error: "No ECX/RCX in context" }});
+          return;
+        }}
+        var xAddress = reg.add(0x08);
+        var yAddress = xAddress.add(0x04);
+        send({{
+          x_address: xAddress.toString(),
+          y_address: yAddress.toString()
+        }});
+      }}
+    }});
+    """
+
+    xy_script = xy_session.create_script(script_code)
+    xy_script.on("message", on_message_xy)
+    xy_script.load()
+
+    print("[xy] Now move your character once in-game to trigger the walk hook...")
+
+    # Block until we have X/Y
+    while xstarted == 0:
+        time.sleep(0.01)
+
+    print("[xy] X/Y resolved.")
 
 
-# ============================
-# MEMORY SCANNER JS (inline)
-# ============================
+# ------------ Memory scanner (Frida RPC) ------------
 
 SCAN_JS_TEMPLATE = """
 var xPtr = ptr("%s");
-var yPtr = ptr("%s");
 var start = xPtr.sub(%d);
 var size = %d;
 
 function takeSnapshot() {
     var out = {};
     for (var i = 0; i < size; i++) {
-        var b = Memory.readU8(start.add(i));
-        out[i] = b;
+        out[i] = Memory.readU8(start.add(i));
     }
     return out;
 }
@@ -66,153 +129,91 @@ function takeSnapshot() {
 var snapshot = takeSnapshot();
 
 rpc.exports = {
-    diffscan: function(dir) {
-        var now = takeSnapshot();
-        var changed = [];
-        for (var i = 0; i < size; i++) {
-            if (now[i] !== snapshot[i]) {
-                changed.push(i);
-            }
-        }
-        snapshot = now;
-        return changed;
+  diffscan: function() {
+    var now = takeSnapshot();
+    var changed = [];
+    for (var i = 0; i < size; i++) {
+      if (now[i] !== snapshot[i]) {
+        changed.push(i);
+      }
     }
+    snapshot = now;
+    return changed;
+  }
 };
 """
 
 
-# ============================
-# GUI CLASS
-# ============================
+def start_scanner_session():
+    """
+    Attach a fresh Frida session that exposes diffscan(), which returns
+    offsets inside [x_address-PRE_BYTES, x_address-PRE_BYTES+SCAN_RANGE)
+    that changed since the last snapshot.
+    """
+    global scan_session, scan_script
 
-class ScannerGUI:
-    def __init__(self, master):
-        self.master = master
-        master.title("EO Movement Scanner")
-        master.geometry("600x420")
+    if x_address is None:
+        raise RuntimeError("x_address is not set; run XY hook first.")
 
-        self.log = scrolledtext.ScrolledText(master, width=70, height=18)
-        self.log.pack(pady=10)
+    scan_session = frida.attach("Endless.exe")
+    js = SCAN_JS_TEMPLATE % (hex(x_address), PRE_BYTES, SCAN_RANGE)
+    scan_script = scan_session.create_script(js)
+    scan_script.load()
+    print("[scan] Scanner script loaded. Baseline snapshot captured.")
 
-        btn_frame = tk.Frame(master)
-        btn_frame.pack()
 
-        tk.Button(btn_frame, text="Scan UP", width=12,
-                  command=lambda: self.do_scan("up")).grid(row=0, column=0, padx=5, pady=5)
+def scan_direction(direction: str):
+    """
+    One pass: user holds UP/DOWN/LEFT/RIGHT in EO, we diff the memory
+    window and record all changed absolute addresses for that direction.
+    """
+    print(f"\n[scan] >>> Prepare to scan {direction.upper()} movement.")
+    print(f"[scan] Hold the {direction.upper()} key in Endless Online, then press Enter here.")
+    input()
+    time.sleep(0.2)  # small delay to make sure state is 'held'
 
-        tk.Button(btn_frame, text="Scan DOWN", width=12,
-                  command=lambda: self.do_scan("down")).grid(row=0, column=1, padx=5, pady=5)
+    changed = scan_script.exports.diffscan()
+    base_start = x_address - PRE_BYTES
+    abs_addrs = [hex(base_start + off) for off in changed]
+    results[direction] = abs_addrs
 
-        tk.Button(btn_frame, text="Scan LEFT", width=12,
-                  command=lambda: self.do_scan("left")).grid(row=0, column=2, padx=5, pady=5)
+    print(f"[scan] {direction.upper()}: {len(abs_addrs)} changed addresses recorded.")
 
-        tk.Button(btn_frame, text="Scan RIGHT", width=12,
-                  command=lambda: self.do_scan("right")).grid(row=0, column=3, padx=5, pady=5)
 
-        tk.Button(master, text="Save Results", width=20,
-                  command=self.save_results).pack(pady=10)
+# ------------ CLI entrypoint ------------
 
-        self.wait_for_xy()
+def main():
+    print("=== EO Movement Flag Scanner (Frida 16, no GUI) ===")
+    print("Make sure Endless.exe is running and your character is in-game.")
+    input("Press Enter to attach and resolve X/Y using walkAddress hook...")
 
-    # -------------------------
-    def write(self, text):
-        self.log.insert(tk.END, text + "\n")
-        self.log.see(tk.END)
+    start_frida_session_xy(WALK_ADDRESS)
+    print(f"[main] Using resolved X={hex(x_address)}, Y={hex(y_address)}")
 
-    # -------------------------
-    def wait_for_xy(self):
-        self.write("[*] Hooking walkAddress to detect X/Y...")
-        global session
+    start_scanner_session()
 
-        session = frida.attach("Endless.exe")
+    for direction in ("up", "down", "left", "right"):
+        scan_direction(direction)
 
-        def on_msg(message, data):
-            global x_address, y_address
-            if message["type"] == "send":
-                payload = message["payload"]
-                x_address = int(payload["x_addr"], 16)
-                y_address = int(payload["y_addr"], 16)
-                self.write(f"[+] X = {hex(x_address)}, Y = {hex(y_address)}")
-                session.detach()
-            elif message["type"] == "error":
-                self.write(str(message))
+    filename = "movement_addresses.json"
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=4)
 
-        script_xy = session.create_script(XY_HOOK_JS)
-        script_xy.on("message", on_msg)
-        script_xy.load()
+    print(f"\n[done] Saved absolute movement addresses to {filename}")
+    print(json.dumps(results, indent=4))
 
-        self.write("Move your character once to trigger hook...")
-
-        # Wait for detection
-        while x_address is None or y_address is None:
-            time.sleep(0.05)
-
-        self.write("[OK] X/Y addresses locked in.")
-        self.create_scanner()
-
-    # -------------------------
-    def create_scanner(self):
-        global session, script, baseline
-
-        session = frida.attach("Endless.exe")
-
-        scan_js = SCAN_JS_TEMPLATE % (
-            hex(x_address),
-            hex(y_address),
-            PRE_BYTES,
-            SCAN_RANGE
-        )
-
-        script = session.create_script(scan_js)
-        script.load()
-
-        # Take initial snapshot
-        self.write("[*] Initializing baseline snapshot...")
-        baseline = {}  # not needed—JS handles it
-        time.sleep(0.2)
-        self.write("[OK] Baseline ready.")
-
-    # -------------------------
-    def do_scan(self, direction):
-        global results
-        self.write(f"[*] Hold {direction.upper()} for 1 second...")
-        time.sleep(1.0)
-
+    # Clean up sessions
+    if scan_session is not None:
         try:
-            changed = script.exports.diffscan(direction)
-            abs_addrs = []
+            scan_session.detach()
+        except Exception:
+            pass
+    if xy_session is not None:
+        try:
+            xy_session.detach()
+        except Exception:
+            pass
 
-            for off in changed:
-                abs_addrs.append(hex(x_address - PRE_BYTES + off))
-
-            results[direction] = abs_addrs
-            self.write(f"[+] {direction.upper()} changed {len(abs_addrs)} bytes.")
-        except Exception as e:
-            self.write(f"[ERROR] {e}")
-
-    # -------------------------
-    def save_results(self):
-        global results
-
-        path = filedialog.asksaveasfilename(
-            defaultextension=".json",
-            filetypes=[("JSON files", "*.json")]
-        )
-
-        if not path:
-            return
-
-        with open(path, "w") as f:
-            json.dump(results, f, indent=4)
-
-        messagebox.showinfo("Saved", f"Movement addresses saved to:\n{path}")
-
-
-# ============================
-# RUN GUI
-# ============================
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    gui = ScannerGUI(root)
-    root.mainloop()
+    main()
