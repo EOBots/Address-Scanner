@@ -1,0 +1,218 @@
+import frida
+import time
+import json
+import tkinter as tk
+from tkinter import messagebox, scrolledtext, filedialog
+
+# ============================
+# CONFIG (from your script)
+# ============================
+
+WALK_ADDRESS = "0xEEC70"   # walk function address to hook like CeraBot
+SCAN_RANGE = 0x400         # bytes around X/Y to scan
+PRE_BYTES = 0x200          # how far before X to scan
+
+# ============================
+# INTERNAL STATE
+# ============================
+x_address = None
+y_address = None
+baseline = {}
+results = {"up": [], "down": [], "left": [], "right": []}
+
+session = None
+script = None
+
+# ============================
+# HOOK TO DISCOVER X/Y (same as CeraBot)
+# ============================
+
+XY_HOOK_JS = """
+var base = Process.getModuleByName("Endless.exe").base;
+var rel = ptr(%d);
+var target = base.add(rel);
+
+Interceptor.attach(target, {
+    onEnter: function(args) {
+        var reg = this.context.ecx || this.context.rcx;
+        if (!reg) return;
+        var xAddr = reg.add(0x08);
+        var yAddr = xAddr.add(0x04);
+        send({ x_addr: xAddr.toString(), y_addr: yAddr.toString() });
+    }
+});
+""" % int(WALK_ADDRESS, 16)
+
+
+# ============================
+# MEMORY SCANNER JS (inline)
+# ============================
+
+SCAN_JS_TEMPLATE = """
+var xPtr = ptr("%s");
+var yPtr = ptr("%s");
+var start = xPtr.sub(%d);
+var size = %d;
+
+function takeSnapshot() {
+    var out = {};
+    for (var i = 0; i < size; i++) {
+        var b = Memory.readU8(start.add(i));
+        out[i] = b;
+    }
+    return out;
+}
+
+var snapshot = takeSnapshot();
+
+rpc.exports = {
+    diffscan: function(dir) {
+        var now = takeSnapshot();
+        var changed = [];
+        for (var i = 0; i < size; i++) {
+            if (now[i] !== snapshot[i]) {
+                changed.push(i);
+            }
+        }
+        snapshot = now;
+        return changed;
+    }
+};
+"""
+
+
+# ============================
+# GUI CLASS
+# ============================
+
+class ScannerGUI:
+    def __init__(self, master):
+        self.master = master
+        master.title("EO Movement Scanner")
+        master.geometry("600x420")
+
+        self.log = scrolledtext.ScrolledText(master, width=70, height=18)
+        self.log.pack(pady=10)
+
+        btn_frame = tk.Frame(master)
+        btn_frame.pack()
+
+        tk.Button(btn_frame, text="Scan UP", width=12,
+                  command=lambda: self.do_scan("up")).grid(row=0, column=0, padx=5, pady=5)
+
+        tk.Button(btn_frame, text="Scan DOWN", width=12,
+                  command=lambda: self.do_scan("down")).grid(row=0, column=1, padx=5, pady=5)
+
+        tk.Button(btn_frame, text="Scan LEFT", width=12,
+                  command=lambda: self.do_scan("left")).grid(row=0, column=2, padx=5, pady=5)
+
+        tk.Button(btn_frame, text="Scan RIGHT", width=12,
+                  command=lambda: self.do_scan("right")).grid(row=0, column=3, padx=5, pady=5)
+
+        tk.Button(master, text="Save Results", width=20,
+                  command=self.save_results).pack(pady=10)
+
+        self.wait_for_xy()
+
+    # -------------------------
+    def write(self, text):
+        self.log.insert(tk.END, text + "\n")
+        self.log.see(tk.END)
+
+    # -------------------------
+    def wait_for_xy(self):
+        self.write("[*] Hooking walkAddress to detect X/Y...")
+        global session
+
+        session = frida.attach("Endless.exe")
+
+        def on_msg(message, data):
+            global x_address, y_address
+            if message["type"] == "send":
+                payload = message["payload"]
+                x_address = int(payload["x_addr"], 16)
+                y_address = int(payload["y_addr"], 16)
+                self.write(f"[+] X = {hex(x_address)}, Y = {hex(y_address)}")
+                session.detach()
+            elif message["type"] == "error":
+                self.write(str(message))
+
+        script_xy = session.create_script(XY_HOOK_JS)
+        script_xy.on("message", on_msg)
+        script_xy.load()
+
+        self.write("Move your character once to trigger hook...")
+
+        # Wait for detection
+        while x_address is None or y_address is None:
+            time.sleep(0.05)
+
+        self.write("[OK] X/Y addresses locked in.")
+        self.create_scanner()
+
+    # -------------------------
+    def create_scanner(self):
+        global session, script, baseline
+
+        session = frida.attach("Endless.exe")
+
+        scan_js = SCAN_JS_TEMPLATE % (
+            hex(x_address),
+            hex(y_address),
+            PRE_BYTES,
+            SCAN_RANGE
+        )
+
+        script = session.create_script(scan_js)
+        script.load()
+
+        # Take initial snapshot
+        self.write("[*] Initializing baseline snapshot...")
+        baseline = {}  # not needed—JS handles it
+        time.sleep(0.2)
+        self.write("[OK] Baseline ready.")
+
+    # -------------------------
+    def do_scan(self, direction):
+        global results
+        self.write(f"[*] Hold {direction.upper()} for 1 second...")
+        time.sleep(1.0)
+
+        try:
+            changed = script.exports.diffscan(direction)
+            abs_addrs = []
+
+            for off in changed:
+                abs_addrs.append(hex(x_address - PRE_BYTES + off))
+
+            results[direction] = abs_addrs
+            self.write(f"[+] {direction.upper()} changed {len(abs_addrs)} bytes.")
+        except Exception as e:
+            self.write(f"[ERROR] {e}")
+
+    # -------------------------
+    def save_results(self):
+        global results
+
+        path = filedialog.asksaveasfilename(
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json")]
+        )
+
+        if not path:
+            return
+
+        with open(path, "w") as f:
+            json.dump(results, f, indent=4)
+
+        messagebox.showinfo("Saved", f"Movement addresses saved to:\n{path}")
+
+
+# ============================
+# RUN GUI
+# ============================
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    gui = ScannerGUI(root)
+    root.mainloop()
