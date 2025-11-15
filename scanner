@@ -2,11 +2,12 @@ import frida
 import time
 import json
 import ctypes
-from ctypes import wintypes
 
 # ============================
 # CONFIG
 # ============================
+
+PROCESS_NAME = "Endless.exe"
 
 # From your bot:
 WALK_ADDRESS = "0xEEC70"   # RVA of walk/move function from Endless.exe
@@ -15,11 +16,17 @@ WALK_ADDRESS = "0xEEC70"   # RVA of walk/move function from Endless.exe
 PRE_BYTES = 0x200          # bytes before X address to include
 SCAN_RANGE = 0x400         # total bytes in window
 
-# Virtual-key codes for arrow keys
-VK_UP = 0x26
-VK_DOWN = 0x28
-VK_LEFT = 0x25
+# Virtual-key codes (main keyboard, not numpad)
+VK_UP    = 0x26
+VK_DOWN  = 0x28
+VK_LEFT  = 0x25
 VK_RIGHT = 0x27
+
+VK_W = 0x57
+VK_A = 0x41
+VK_S = 0x53
+VK_D = 0x44
+
 KEYEVENTF_KEYUP = 0x0002
 
 user32 = ctypes.WinDLL('user32', use_last_error=True)
@@ -33,14 +40,18 @@ def key_up(vk):
     user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
 
 
-def hold_key_and_scan(direction_name, vk, script, duration=1.5, interval=0.1):
+def hold_keys_and_scan(label, keys, script, duration=1.5, interval=0.1):
     """
-    Hold a key for `duration` seconds, repeatedly calling diffscan()
+    Hold multiple keys for `duration` seconds, repeatedly calling diffscan()
     and unioning all changed offsets. Returns a set of offsets.
     """
     changed_offsets = set()
-    print(f"[scan] Auto-moving {direction_name.upper()} for {duration:.1f}s...")
-    key_down(vk)
+    print(f"[scan] Auto-moving {label.upper()} for {duration:.1f}s...")
+
+    # Press all keys down
+    for vk in keys:
+        key_down(vk)
+
     start = time.time()
     try:
         while time.time() - start < duration:
@@ -49,8 +60,11 @@ def hold_key_and_scan(direction_name, vk, script, duration=1.5, interval=0.1):
                 changed_offsets.update(offs)
             time.sleep(interval)
     finally:
-        key_up(vk)
-    print(f"[scan] {direction_name.upper()} collected {len(changed_offsets)} offsets.")
+        # Release all keys
+        for vk in keys:
+            key_up(vk)
+
+    print(f"[scan] {label.upper()} collected {len(changed_offsets)} offsets.")
     return changed_offsets
 
 
@@ -102,18 +116,18 @@ def resolve_xy():
     global xy_session, xy_script, x_started
 
     print("[xy] Attaching to Endless.exe to resolve X/Y...")
-    xy_session = frida.attach("Endless.exe")
+    xy_session = frida.attach(PROCESS_NAME)
 
     js = f"""
     var mod;
     try {{
-        mod = Process.getModuleByName("Endless.exe");
+        mod = Process.getModuleByName("{PROCESS_NAME}");
     }} catch (e) {{
         var mods = Process.enumerateModules();
         mod = mods.length ? mods[0] : null;
     }}
     if (!mod) {{
-        throw new Error("Could not find Endless.exe module");
+        throw new Error("Could not find {PROCESS_NAME} module");
     }}
 
     var base = mod.base;
@@ -164,7 +178,7 @@ def start_scanner():
         raise RuntimeError("x_address is not resolved.")
 
     print("[scan] Attaching scanner to Endless.exe...")
-    scan_session = frida.attach("Endless.exe")
+    scan_session = frida.attach(PROCESS_NAME)
 
     js = f"""
     var xPtr = ptr("{hex(x_address)}");
@@ -210,7 +224,7 @@ def start_scanner():
 # ============================
 
 def main():
-    print("=== EO Arrow Input Scanner (Frida 16, auto-move, NO filtering) ===")
+    print("=== EO Arrow/WASD Input Scanner (Frida 16, auto-move, NO filtering) ===")
     print("Make sure Endless.exe is running and your character is in-game.")
     input("Press Enter here, then switch to Endless and be ready to move once...")
 
@@ -233,12 +247,44 @@ def main():
 
     # 4) Auto-move each direction and record all changed offsets (NO filtering)
     results_offsets = {}
-    results_offsets["up"] = hold_key_and_scan("up", VK_UP, scan_script, duration=1.5, interval=0.1)
-    results_offsets["right"] = hold_key_and_scan("right", VK_RIGHT, scan_script, duration=1.5, interval=0.1)
-    results_offsets["down"] = hold_key_and_scan("down", VK_DOWN, scan_script, duration=1.5, interval=0.1)
-    results_offsets["left"] = hold_key_and_scan("left", VK_LEFT, scan_script, duration=1.5, interval=0.1)
 
-    # 5) Convert offsets to absolute addresses, no filtering
+    # UP  => Arrow Up + W
+    results_offsets["up"] = hold_keys_and_scan(
+        "up",
+        keys=[VK_UP, VK_W],
+        script=scan_script,
+        duration=1.5,
+        interval=0.1
+    )
+
+    # RIGHT => Arrow Right + D
+    results_offsets["right"] = hold_keys_and_scan(
+        "right",
+        keys=[VK_RIGHT, VK_D],
+        script=scan_script,
+        duration=1.5,
+        interval=0.1
+    )
+
+    # DOWN => Arrow Down + S
+    results_offsets["down"] = hold_keys_and_scan(
+        "down",
+        keys=[VK_DOWN, VK_S],
+        script=scan_script,
+        duration=1.5,
+        interval=0.1
+    )
+
+    # LEFT => Arrow Left + A
+    results_offsets["left"] = hold_keys_and_scan(
+        "left",
+        keys=[VK_LEFT, VK_A],
+        script=scan_script,
+        duration=1.5,
+        interval=0.1
+    )
+
+    # 5) Convert offsets to absolute addresses, NO filtering
     base_start = x_address - PRE_BYTES
     results_abs = {
         direction: [hex(base_start + off) for off in sorted(offsets)]
@@ -255,6 +301,10 @@ def main():
     # 6) Cleanup
     try:
         scan_session.detach()
+    except Exception:
+        pass
+    try:
+        xy_session.detach()
     except Exception:
         pass
 
