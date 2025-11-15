@@ -1,263 +1,79 @@
 import frida
 import time
-import json
 
-# ============================
-# CONFIG
-# ============================
+PROCESS = "Endless.exe"
+WALK_RVA = 0xEEC70  # from your script
 
-WALK_ADDRESS = "0xEEC70"       # from your script
-DIRECTIONAL_RVA = 0x6DACA      # directionalAddress (to detect direction)
-RECORD_SECONDS = 20.0          # how long to record movement
-PRE_BYTES = 0x200
-SCAN_RANGE = 0x400
+session = frida.attach(PROCESS)
 
-# ============================
-# GLOBALS
-# ============================
-
-x_address = None
-y_address = None
-xstarted = 0
-
-xy_session = None
-xy_script = None
-
-scan_session = None
-scan_script = None
-
-# changed offsets → later converted to absolute addresses
-changed_offsets = set()
-
-# ============================
-# FRIDA HOOK — Resolve X/Y
-# ============================
-
-def on_message_xy(message, data):
-    global xstarted, x_address, y_address, xy_session
-
-    if message["type"] == "send":
-        payload = message["payload"]
-        if "error" in payload:
-            print("[frida][xy][error]", payload["error"])
-            return
-
-        x_address = int(payload["x_address"], 16)
-        y_address = int(payload["y_address"], 16)
-        print(f"[xy] X={hex(x_address)}, Y={hex(y_address)}")
-
-        xstarted = 1
-        try:
-            xy_session.detach()
-        except:
-            pass
-
-    elif message["type"] == "error":
-        print("[frida][xy][script error]", message)
-
-
-def start_frida_session_xy():
-    global xy_session, xy_script, xstarted
-
-    xy_session = frida.attach("Endless.exe")
-    print("[xy] Attached, waiting for player movement hook...")
-
-    js = """
-    var mod = Process.getModuleByName("Endless.exe");
-    var base = mod.base;
-    var target = base.add(%d);
-
-    Interceptor.attach(target, {
-        onEnter: function(args) {
-            var reg = this.context.ecx || this.context.rcx;
-            if (!reg) {
-                send({error: "No ECX/RCX"});
-                return;
-            }
-            var xAddress = reg.add(0x08);
-            var yAddress = xAddress.add(0x04);
-
-            send({
-                x_address: xAddress.toString(),
-                y_address: yAddress.toString()
-            });
-        }
-    });
-    """ % int(WALK_ADDRESS, 16)
-
-    xy_script = xy_session.create_script(js)
-    xy_script.on("message", on_message_xy)
-    xy_script.load()
-
-    # Wait until player moves once
-    while xstarted == 0:
-        time.sleep(0.01)
-
-    print("[xy] X/Y resolved successfully.")
-
-
-# ============================
-# FRIDA MEMORY RECORDER
-# ============================
-
-SCAN_JS_TEMPLATE = """
+js_code = """
 var mod = Process.getModuleByName("Endless.exe");
 var base = mod.base;
-var dirPtr = base.add(%d);
+var walkFuncPtr = base.add(%d);   // EO movement function
 
-var xPtr = ptr("%s");
-var start = xPtr.sub(%d);
-var size = %d;
+var playerPtr = null;
 
-function takeSnap() {
-    var out = {};
-    for (var i = 0; i < size; i++) {
-        out[i] = Memory.readU8(start.add(i));
+// Hook movement to capture player struct pointer
+Interceptor.attach(walkFuncPtr, {
+    onEnter: function(args) {
+        var reg = this.context.ecx || this.context.rcx;
+        if (reg && !playerPtr) {
+            playerPtr = reg;
+            send({"player": playerPtr.toString()});
+        }
     }
-    return out;
-}
+});
 
-var baseline = null;
+// Create callable movement function
+var walkFunc = new NativeFunction(walkFuncPtr, 'void', ['int']);
 
 rpc.exports = {
-    idle: function() {
-        baseline = takeSnap();
+    move: function(dir) {
+        if (playerPtr === null)
+            return -1; // not ready
+        walkFunc(dir);
+        return 1;
     },
-    diff: function() {
-        var now = takeSnap();
-        var c = [];
-        for (var i = 0; i < size; i++) {
-            if (now[i] !== baseline[i]) c.push(i);
-        }
-        return c;
-    },
-    readdir: function() {
-        return Memory.readU8(dirPtr);
+    isready: function() {
+        return playerPtr !== null;
     }
 };
-"""
+""" % WALK_RVA
 
+script = session.create_script(js_code)
 
-def start_recorder():
-    global scan_session, scan_script
+def on_msg(message, data):
+    if message["type"] == "send":
+        print("[JS]", message["payload"])
+    else:
+        print("[ERR]", message)
 
-    scan_session = frida.attach("Endless.exe")
+script.on("message", on_msg)
+script.load()
 
-    js = SCAN_JS_TEMPLATE % (
-        DIRECTIONAL_RVA,
-        hex(x_address),
-        PRE_BYTES,
-        SCAN_RANGE
-    )
+print("Move once in EO to capture player pointer...")
 
-    scan_script = scan_session.create_script(js)
-    scan_script.load()
+# Wait for pointer
+while script.exports.isready() == False:
+    time.sleep(0.1)
 
-    print("[rec] Stand still, capturing idle baseline in 5 seconds...")
-    time.sleep(5)
-    scan_script.exports.idle()
-    print("[rec] Baseline captured.")
+print("Ready!")
 
+# Test movement:
+print("Moving UP...")
+script.exports.move(0)
+time.sleep(1)
 
-def record_changes():
-    global changed_offsets
+print("Moving RIGHT...")
+script.exports.move(1)
+time.sleep(1)
 
-    print(f"[rec] Recording for {RECORD_SECONDS} seconds...")
-    end = time.time() + RECORD_SECONDS
-    while time.time() < end:
-        offs = scan_script.exports.diff()
-        if offs:
-            changed_offsets.update(offs)
-        time.sleep(0.05)
+print("Moving DOWN...")
+script.exports.move(2)
+time.sleep(1)
 
-    print("[rec] Recording finished.")
-    print(f"[rec] {len(changed_offsets)} offsets changed.")
+print("Moving LEFT...")
+script.exports.move(3)
+time.sleep(1)
 
-
-# ============================
-# FRIDA WRITE TRACER
-# ============================
-
-def trace_addresses(abs_addresses):
-    """
-    For each absolute address, attach an Interceptor to log writes.
-    """
-    print("[trace] Attaching write hooks...")
-
-    trace_script_js = "var hooks = [];\n"
-
-    for addr in abs_addresses:
-        trace_script_js += f"""
-        var a{addr.replace("0x","")} = ptr("{addr}");
-        hooks.push(Interceptor.attach(a{addr.replace("0x","")}, {{
-            onWrite: function(args) {{
-                send({{
-                    written_to: "{addr}",
-                    ip: this.context.rip ? this.context.rip.toString() : this.context.eip.toString(),
-                    regs: {{
-                        rcx: this.context.rcx,
-                        rdx: this.context.rdx,
-                        rbx: this.context.rbx,
-                        rax: this.context.rax
-                    }}
-                }});
-            }}
-        }}));
-        """
-
-    trace_session = frida.attach("Endless.exe")
-    trace_script = trace_session.create_script(trace_script_js)
-
-    events = []
-
-    def on_trace_msg(message, data):
-        if message["type"] == "send":
-            events.append(message["payload"])
-
-    trace_script.on("message", on_trace_msg)
-    trace_script.load()
-
-    print("[trace] Now move around for ~10 seconds to trigger writes...")
-    time.sleep(10)
-
-    trace_session.detach()
-    return events
-
-
-# ============================
-# MAIN
-# ============================
-
-def main():
-    print("=== EO Movement Scanner + Write Tracer ===\n")
-
-    # 1. Resolve X/Y
-    start_frida_session_xy()
-
-    # 2. Start recorder
-    start_recorder()
-
-    # 3. Auto-record
-    record_changes()
-
-    # 4. Convert changed offsets → absolute addresses
-    base = x_address - PRE_BYTES
-    absolute_addresses = [hex(base + off) for off in changed_offsets]
-
-    with open("movement_raw.json", "w") as f:
-        json.dump({"raw_addresses": absolute_addresses}, f, indent=4)
-
-    print(f"\n[save] Saved {len(absolute_addresses)} raw addresses to movement_raw.json")
-
-    # 5. Trace writes to those addresses
-    events = trace_addresses(absolute_addresses)
-
-    with open("movement_writes.json", "w") as f:
-        json.dump(events, f, indent=4)
-
-    print("[save] Write trace saved to movement_writes.json")
-    print("[done] Complete.\n")
-
-
-if __name__ == "__main__":
-    main()
+print("Done.")
