@@ -1,29 +1,25 @@
-import frida
 import time
 import json
-import ctypes
-import ctypes.wintypes as wintypes
+import frida
 
 # ============================
 # CONFIG
 # ============================
 
-WALK_ADDRESS = "0xEEC70"   # walk function RVA from Endless.exe (your script)
+# From your script
+WALK_ADDRESS = "0xEEC70"   # walk function RVA from Endless.exe
+DIRECTIONAL_RVA = 0x6DACA  # directionalAddress from your script
+
 PRE_BYTES = 0x200          # bytes before X address to include in scan window
 SCAN_RANGE = 0x400         # total scan window size in bytes
 
-# Hotkey IDs (arbitrary, just must be unique in this process)
-HK_UP = 1
-HK_DOWN = 2
-HK_LEFT = 3
-HK_RIGHT = 4
-
-# Map directions to hotkey IDs and F-keys
-DIR_TO_HK = {
-    "up":    (HK_UP,    "F9"),
-    "down":  (HK_DOWN,  "F10"),
-    "left":  (HK_LEFT,  "F11"),
-    "right": (HK_RIGHT, "F12"),
+# Assumed mapping of directional byte -> direction name
+# Adjust if needed after you see results.
+DIR_MAPPING = {
+    0: "up",
+    1: "right",
+    2: "down",
+    3: "left",
 }
 
 # ============================
@@ -40,52 +36,13 @@ xy_script = None
 scan_session = None
 scan_script = None
 
-# store offsets (ints relative to base window); we turn these into absolute
-offset_results = {"up": [], "down": [], "left": [], "right": []}
-
-# ============================
-# WINDOWS HOTKEY SETUP (WM_HOTKEY)
-# ============================
-
-user32 = ctypes.windll.user32
-WM_HOTKEY = 0x0312
-
-# Register F9–F12 as global hotkeys (no admin required)
-# F9  = 0x78
-# F10 = 0x79
-# F11 = 0x7A
-# F12 = 0x7B
-user32.RegisterHotKey(None, HK_UP,    0, 0x78)  # F9
-user32.RegisterHotKey(None, HK_DOWN,  0, 0x79)  # F10
-user32.RegisterHotKey(None, HK_LEFT,  0, 0x7A)  # F11
-user32.RegisterHotKey(None, HK_RIGHT, 0, 0x7B)  # F12
-
-
-def wait_for_hotkey(expected_id: int):
-    """
-    Block until the WM_HOTKEY with the given ID (wParam) is received.
-    Works even if the console is minimized and Endless.exe is focused.
-    """
-    msg = wintypes.MSG()
-    while True:
-        # GetMessage blocks until a message is available.
-        # Return value:
-        #   >0 : message retrieved
-        #    0 : WM_QUIT
-        #   -1 : error
-        ret = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
-        if ret == -1:
-            # Error, just continue looping
-            continue
-
-        if msg.message == WM_HOTKEY and msg.wParam == expected_id:
-            # This is the hotkey we were waiting for
-            return
-
-        # For other messages, just do normal translation/dispatch
-        user32.TranslateMessage(ctypes.byref(msg))
-        user32.DispatchMessageW(ctypes.byref(msg))
-
+# store offsets (ints relative to scan window); convert to abs later
+offset_results = {
+    "up": set(),
+    "down": set(),
+    "left": set(),
+    "right": set(),
+}
 
 # ============================
 # XY RESOLVER (Frida hook, same pattern as your bot)
@@ -123,7 +80,7 @@ def on_message_xy(message, data):
 def start_frida_session_xy(walk_address: str):
     """
     Attach to Endless.exe and hook the walk function at WALK_ADDRESS
-    to resolve the dynamic X/Y addresses (same logic as CeraBot v12.2/v13).
+    to resolve the dynamic X/Y addresses (same logic as your bot).
     """
     global xy_session, xy_script, xstarted
 
@@ -131,47 +88,44 @@ def start_frida_session_xy(walk_address: str):
     xy_session = frida.attach("Endless.exe")
     print("[xy] Attached to Endless.exe, waiting for movement hook...")
 
-    # Inline JS, using the same safe pattern as your bot:
-    script_code = f"""
+    # Inline JS, uses WALK_ADDRESS as an RVA from module base
+    script_code = """
     var mod = null;
-    try {{
+    try {
       mod = Process.getModuleByName("Endless.exe");
-    }} catch (e) {{
+    } catch (e) {
       var mods = Process.enumerateModules();
       mod = mods.length ? mods[0] : null;
-    }}
-
-    if (!mod) {{
+    }
+    if (!mod) {
       throw new Error("Could not find module base for Endless.exe");
-    }}
-
+    }
     var base = mod.base;
-    var rel  = ptr({int(walk_address, 16)});
+    var rel = ptr(%d);
     var target = base.add(rel);
 
-    Interceptor.attach(target, {{
-      onEnter: function(args) {{
+    Interceptor.attach(target, {
+      onEnter: function(args) {
         var reg = this.context.ecx || this.context.rcx;
-        if (!reg) {{
-          send({{ error: "No ECX/RCX in context" }});
+        if (!reg) {
+          send({ error: "No ECX/RCX in context" });
           return;
-        }}
+        }
         var xAddress = reg.add(0x08);
         var yAddress = xAddress.add(0x04);
-        send({{
+        send({
           x_address: xAddress.toString(),
           y_address: yAddress.toString()
-        }});
-      }}
-    }});
-    """
+        });
+      }
+    });
+    """ % int(walk_address, 16)
 
     xy_script = xy_session.create_script(script_code)
     xy_script.on("message", on_message_xy)
     xy_script.load()
 
-    print("[xy] Now MOVE your character once in-game to trigger the walk hook "
-          "(keep Endless focused).")
+    print("[xy] Now move your character once in-game to trigger the walk hook...")
 
     # Block until we have X/Y
     while xstarted == 0:
@@ -185,16 +139,29 @@ def start_frida_session_xy(walk_address: str):
 # ============================
 
 SCAN_JS_TEMPLATE = """
+var mod = null;
+try {
+  mod = Process.getModuleByName("Endless.exe");
+} catch (e) {
+  var mods = Process.enumerateModules();
+  mod = mods.length ? mods[0] : null;
+}
+if (!mod) {
+  throw new Error("Could not find Endless.exe module");
+}
+var base = mod.base;
+var dirPtr = base.add(%d);
+
 var xPtr = ptr("%s");
 var start = xPtr.sub(%d);
 var size = %d;
 
 function takeSnapshot() {
-    var out = {};
-    for (var i = 0; i < size; i++) {
-        out[i] = Memory.readU8(start.add(i));
-    }
-    return out;
+  var out = {};
+  for (var i = 0; i < size; i++) {
+    out[i] = Memory.readU8(start.add(i));
+  }
+  return out;
 }
 
 var baseline = null;
@@ -215,6 +182,9 @@ rpc.exports = {
       }
     }
     return changed;
+  },
+  readdirection: function() {
+    return Memory.readU8(dirPtr);
   }
 };
 """
@@ -225,6 +195,7 @@ def start_scanner_session():
     Attach a fresh Frida session that exposes:
       - resetbaseline(): capture idle snapshot
       - diffscan(): offsets that differ from baseline
+      - readdirection(): current value of directionalAddress
     """
     global scan_session, scan_script
 
@@ -232,41 +203,55 @@ def start_scanner_session():
         raise RuntimeError("x_address is not set; run XY hook first.")
 
     scan_session = frida.attach("Endless.exe")
-    js = SCAN_JS_TEMPLATE % (hex(x_address), PRE_BYTES, SCAN_RANGE)
+    js = SCAN_JS_TEMPLATE % (DIRECTIONAL_RVA, hex(x_address), PRE_BYTES, SCAN_RANGE)
     scan_script = scan_session.create_script(js)
     scan_script.load()
     print("[scan] Scanner script loaded.")
 
-    # ask user to stand still, then capture baseline
-    print("\n[scan] Stand still in-game (no movement at all).")
-    input("[scan] When you are idle, press Enter HERE to capture baseline...")
+    # Ask user to stand still, then capture baseline automatically
+    print("\n[scan] Stand still in-game (no movement).")
+    print("[scan] Capturing idle baseline in 5 seconds...")
+    time.sleep(5.0)
     scan_script.exports.resetbaseline()
     print("[scan] Idle baseline captured.")
 
 
-def scan_direction(direction: str):
+def auto_record(total_seconds=20.0, interval=0.1):
     """
-    One pass: user focuses Endless Online, holds the arrow key for this
-    direction, and presses the global hotkey (F9/F10/F11/F12).
-    We diff the memory window vs the idle baseline and record the offsets.
+    Auto-record loop:
+      - For total_seconds, repeatedly:
+        - read directionalAddress
+        - diff vs baseline
+        - bucket offsets by direction according to DIR_MAPPING
+    You: in Endless, just keep cycling Up -> Right -> Down -> Left.
     """
-    hk_id, hk_name = DIR_TO_HK[direction]
+    end_time = time.time() + total_seconds
+    print(f"\n[rec] Auto-recording for {total_seconds} seconds.")
+    print("[rec] In Endless, repeatedly move UP, RIGHT, DOWN, LEFT in a loop while this runs.")
+    print("[rec] Example: Up 1–2s, Right 1–2s, Down 1–2s, Left 1–2s, repeat...")
 
-    print(f"\n[scan] >>> {direction.upper()} SCAN")
-    print("[scan] 1) Focus Endless Online window.")
-    print(f"[scan] 2) HOLD the {direction.upper()} ARROW key (keep it held).")
-    print(f"[scan] 3) While still holding it, press {hk_name} once.")
-    print(f"[scan] Waiting for {hk_name} hotkey...")
+    while time.time() < end_time:
+        try:
+            dir_val = scan_script.exports.readdirection()
+            changed = scan_script.exports.diffscan()
+        except Exception as e:
+            print("[rec] Error during record:", e)
+            break
 
-    # Wait for the correct WM_HOTKEY to fire
-    wait_for_hotkey(hk_id)
+        if not changed:
+            time.sleep(interval)
+            continue
 
-    # small delay to ensure movement is actively happening when we sample
-    time.sleep(0.15)
+        dir_name = DIR_MAPPING.get(dir_val)
+        if dir_name is None:
+            # Unknown direction code; skip
+            time.sleep(interval)
+            continue
 
-    changed = scan_script.exports.diffscan()
-    offset_results[direction] = changed
-    print(f"[scan] {direction.upper()}: {len(changed)} offsets changed vs idle.")
+        offset_results[dir_name].update(changed)
+        time.sleep(interval)
+
+    print("[rec] Recording window complete.")
 
 
 # ============================
@@ -281,29 +266,25 @@ def compute_absolute_results():
     """
     base_start = x_address - PRE_BYTES
 
-    # Convert offsets to sets for filtering
-    sets = {
-        d: set(offset_results.get(d, []))
-        for d in ("up", "down", "left", "right")
-    }
-
-    # raw addresses per direction
+    # raw absolute addresses
     raw_abs = {
-        d: [hex(base_start + off) for off in sorted(sets[d])]
-        for d in sets
+        d: [hex(base_start + off) for off in sorted(list(offset_results[d]))]
+        for d in offset_results
     }
 
     # unique per-direction: changed for that direction, not for the others
+    sets = {d: set(offset_results[d]) for d in offset_results}
     unique_offsets = {}
     for d in sets:
-        other_dirs = [od for od in sets.keys() if od != d]
-        others_union = set()
-        for od in other_dirs:
-            others_union |= sets[od]
-        unique_offsets[d] = sets[d] - others_union
+        others = set()
+        for od in sets:
+            if od == d:
+                continue
+            others |= sets[od]
+        unique_offsets[d] = sets[d] - others
 
     unique_abs = {
-        d: [hex(base_start + off) for off in sorted(unique_offsets[d])]
+        d: [hex(base_start + off) for off in sorted(list(unique_offsets[d]))]
         for d in unique_offsets
     }
 
@@ -315,25 +296,24 @@ def compute_absolute_results():
 # ============================
 
 def main():
-    print("=== EO Movement Flag Scanner (Frida 16, WM_HOTKEY global F-keys) ===")
+    print("=== EO Movement Flag Scanner (Frida 16, AUTO RECORD) ===")
     print("Make sure Endless.exe is running and your character is in-game.")
 
-    input("Press Enter here once, then switch to Endless and be ready to move...")
-
+    # 1) Resolve X/Y via walk hook
     start_frida_session_xy(WALK_ADDRESS)
     print(f"[main] Using resolved X={hex(x_address)}, Y={hex(y_address)}")
 
+    # 2) Start scanner + idle baseline
     start_scanner_session()
 
-    # Run in this fixed order, with clear prompts:
-    for direction in ("up", "down", "left", "right"):
-        scan_direction(direction)
+    # 3) Auto record while you move around
+    auto_record(total_seconds=20.0, interval=0.1)
 
+    # 4) Compute and save results
     raw_abs, unique_abs = compute_absolute_results()
-
     data = {
         "raw": raw_abs,
-        "unique": unique_abs
+        "unique": unique_abs,
     }
 
     filename = "movement_addresses.json"
@@ -343,7 +323,7 @@ def main():
     print(f"\n[done] Saved movement addresses to {filename}")
     print(json.dumps(data, indent=4))
 
-    # Clean up sessions
+    # 5) Clean up sessions
     if scan_session is not None:
         try:
             scan_session.detach()
@@ -354,12 +334,6 @@ def main():
             xy_session.detach()
         except Exception:
             pass
-
-    # Unregister hotkeys (cleanup)
-    user32.UnregisterHotKey(None, HK_UP)
-    user32.UnregisterHotKey(None, HK_DOWN)
-    user32.UnregisterHotKey(None, HK_LEFT)
-    user32.UnregisterHotKey(None, HK_RIGHT)
 
 
 if __name__ == "__main__":
