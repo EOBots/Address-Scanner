@@ -1,54 +1,22 @@
 import frida
 import time
-import json
+import random
 
 PROCESS_NAME = "Endless.exe"
-DIRECTIONAL_RVA = 0x6DACA  # from CeraBot v12.2
+DIRECTIONAL_RVA = 0x6DACA  # from your CeraBot v12.2
 
-directional_addr = None
-direction_value = None
-session = None
-resolved = False
+TEST_DURATION_SECONDS = 4 * 60   # 4 minutes
+STEP_INTERVAL_SECONDS = 0.35     # time between direction changes
 
 
-def on_message(message, data):
-    global directional_addr, direction_value, resolved, session
+def main():
+    print("=== EO Random Walk Tester (Frida 16, memory-based, unfocused OK) ===")
+    print("Make sure Endless.exe is running and your character is in-game.")
+    input("Press Enter here, then go to EO and be ready to move ONCE...")
 
-    if message["type"] == "send":
-        payload = message["payload"]
-        if "error" in payload:
-            print("[frida][dir] error:", payload["error"])
-            return
-
-        addr_str = payload.get("directional_address")
-        val_str = payload.get("character_direction")
-        if not addr_str:
-            print("[frida][dir] unexpected payload:", payload)
-            return
-
-        directional_addr = int(addr_str, 16)
-        direction_value = int(val_str) if val_str is not None else None
-
-        print(f"[frida][dir] directional_address = {hex(directional_addr)}, value = {direction_value}")
-        resolved = True
-
-        try:
-            session.detach()
-        except Exception:
-            pass
-
-    elif message["type"] == "error":
-        print("[frida][dir] script error:", message)
-
-
-def resolve_directional():
-    global session, resolved
-
-    print("[*] Attaching to Endless.exe...")
     session = frida.attach(PROCESS_NAME)
-    print("[*] Hooking directional RVA 0x%X..." % DIRECTIONAL_RVA)
 
-    js = f"""
+    js_code = f"""
     var mod = null;
     try {{
       mod = Process.getModuleByName("{PROCESS_NAME}");
@@ -56,11 +24,22 @@ def resolve_directional():
       var mods = Process.enumerateModules();
       mod = mods.length ? mods[0] : null;
     }}
-    if (!mod) throw new Error("Could not find module base for {PROCESS_NAME}");
+    if (!mod) {{
+      throw new Error("Could not find module base for {PROCESS_NAME}");
+    }}
 
     var base = mod.base;
     var rel  = ptr({DIRECTIONAL_RVA});
     var target = base.add(rel);
+
+    var dirAddr = null;
+    var ready = false;
+
+    // 0 = down, 1 = left, 2 = up, 3 = right (from your scan)
+    var DIR_DOWN  = 0;
+    var DIR_LEFT  = 1;
+    var DIR_UP    = 2;
+    var DIR_RIGHT = 3;
 
     Interceptor.attach(target, {{
       onEnter: function(args) {{
@@ -70,65 +49,103 @@ def resolve_directional():
           return;
         }}
         var characterDirectionAddress = ebx.add(0x55);
-        var characterDirection = characterDirectionAddress.readU8();
+        dirAddr = characterDirectionAddress;
+        ready = true;
+
+        var currentDir = characterDirectionAddress.readU8();
         send({{
           directional_address: characterDirectionAddress.toString(),
-          character_direction: characterDirection.toString()
+          current_direction: currentDir.toString()
         }});
       }}
     }});
+
+    function setFlagsForDir(dir) {{
+      if (!dirAddr) return;
+      // From your scan:
+      // flag_base = directional_address - 0x10
+      var flagBase = dirAddr.sub(0x10);
+
+      // order: 0 = down, 1 = left, 2 = up, 3 = right
+      // we'll use 1 for active, 0 for inactive
+      flagBase.writeU8(dir === DIR_DOWN  ? 1 : 0);        // down
+      flagBase.add(1).writeU8(dir === DIR_LEFT  ? 1 : 0); // left
+      flagBase.add(2).writeU8(dir === DIR_UP    ? 1 : 0); // up
+      flagBase.add(3).writeU8(dir === DIR_RIGHT ? 1 : 0); // right
+    }}
+
+    rpc.exports = {{
+      isready: function() {{
+        return ready;
+      }},
+      getdirectionaddr: function() {{
+        if (!dirAddr) return "0x0";
+        return dirAddr.toString();
+      }},
+      getdir: function() {{
+        if (!dirAddr) return -1;
+        return dirAddr.readU8();
+      }},
+      setdir: function(dir) {{
+        // dir: 0=down,1=left,2=up,3=right
+        if (!dirAddr) return;
+        dirAddr.writeU8(dir);
+        setFlagsForDir(dir);
+      }}
+    }};
     """
 
-    script = session.create_script(js)
+    script = session.create_script(js_code)
+
+    def on_message(message, data):
+        if message["type"] == "send":
+            print("[JS]", message["payload"])
+        elif message["type"] == "error":
+            print("[JS-ERROR]", message)
+
     script.on("message", on_message)
     script.load()
 
-    print("[*] Directional hook armed. Move once in EO to trigger it...")
-    while not resolved:
+    print("[*] Directional hook armed.")
+    print("[*] Now, in EO, press ANY movement key once (up/left/down/right) to trigger it...")
+
+    # Wait for dirAddr to be discovered
+    while not script.exports.isready():
         time.sleep(0.05)
-    print("[*] Directional address resolved.")
 
+    dir_addr_str = script.exports.getdirectionaddr()
+    print(f"[*] directional_address resolved to {dir_addr_str}")
+    print("[*] You can now ALT+TAB away from EO if you want.")
+    print(f"[*] Starting random walk test for {TEST_DURATION_SECONDS} seconds...")
 
-def main():
-    print("=== EO Direction & Flag Resolver (Frida 16) ===")
-    print("Make sure Endless.exe is running and you are in-game.")
-    input("Press Enter here, then move once in EO...")
+    start = time.time()
+    end = start + TEST_DURATION_SECONDS
+    step_count = 0
 
-    resolve_directional()
+    DIR_DOWN  = 0
+    DIR_LEFT  = 1
+    DIR_UP    = 2
+    DIR_RIGHT = 3
 
-    # Now compute the flag addresses based on your scan:
-    # flag_base = directional_addr - 0x10
-    flag_base = directional_addr - 0x10
+    directions = [DIR_DOWN, DIR_LEFT, DIR_UP, DIR_RIGHT]
+    names = {DIR_DOWN: "DOWN", DIR_LEFT: "LEFT", DIR_UP: "UP", DIR_RIGHT: "RIGHT"}
 
-    down_flag  = flag_base + 0  # down
-    left_flag  = flag_base + 1  # left
-    up_flag    = flag_base + 2  # up
-    right_flag = flag_base + 3  # right
+    while time.time() < end:
+        step_count += 1
+        dir_choice = random.choice(directions)
+        script.exports.setdir(dir_choice)
+        print(f"[STEP {step_count}] Set direction = {names[dir_choice]} ({dir_choice})")
+        time.sleep(STEP_INTERVAL_SECONDS)
 
-    result = {
-        "directional_address": hex(directional_addr),
-        "direction_value_mapping": {
-            "down": 0,
-            "left": 1,
-            "up": 2,
-            "right": 3
-        },
-        "flag_base": hex(flag_base),
-        "direction_flags": {
-            "down":  hex(down_flag),
-            "left":  hex(left_flag),
-            "up":    hex(up_flag),
-            "right": hex(right_flag)
-        }
-    }
+    print("\n[done] Random walk test completed.")
+    print(f"Ran for ~{TEST_DURATION_SECONDS} seconds, {step_count} steps.")
 
-    outfile = "eo_direction_resolved.json"
-    with open(outfile, "w", encoding="utf-8") as f:
-        json.dump(result, f, indent=4)
-
-    print("\n[done] Saved resolved addresses to", outfile)
-    print(json.dumps(result, indent=4))
+    try:
+        session.detach()
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
     main()
+
