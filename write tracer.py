@@ -5,27 +5,28 @@ import collections
 
 PROCESS_NAME = "Endless.exe"
 
-# Your current run's direction byte:
-TARGET_ADDR = 0x265c821    # dir = 0/1/2/3
+# Use the real addresses YOU found
+WATCH_START = 0x824200     # start of cluster
+WATCH_SIZE  = 0x80         # cover the whole region 0x824200–0x824280
+RECORD_SECONDS = 30        # how long you move around
 
 
 def main():
-    print("=== EO Direction Byte Write Tracer (0x265c821, Frida 16) ===")
-    print(f"Watching exactly this byte: 0x{TARGET_ADDR:08X}")
-    print("This is the 'dir' byte you saw updating when you pressed movement keys.")
-    print("\nMake sure Endless.exe is running and your character is in-game.")
-    input("Press Enter here, then alt-tab to EO and move around (all directions) "
-          "for ~20–30 seconds...\n")
+    print("=== EO REAL MOVEMENT INPUT TRACER (Frida 16) ===")
+    print("Monitoring writes in region:")
+    print(f"  0x{WATCH_START:08X} – 0x{WATCH_START + WATCH_SIZE - 1:08X}")
+    print("These addresses change uniquely per direction, this is REAL INPUT.")
+    print("\nMake sure Endless.exe is running and in-game.")
+    input(f"Press Enter here, then move around in EO for {RECORD_SECONDS} seconds...")
 
     session = frida.attach(PROCESS_NAME)
     all_records = []
 
     js = f"""
     var range = {{
-      base: ptr("0x{TARGET_ADDR:X}"),
-      size: 1
+      base: ptr("0x{WATCH_START:X}"),
+      size: {WATCH_SIZE}
     }};
-
     var records = [];
 
     MemoryAccessMonitor.enable(range, {{
@@ -38,15 +39,14 @@ def main():
         records.push({{
           from: details.from.toString(),
           addr: details.address.toString(),
-          operation: details.operation,  // 'read' or 'write'
+          operation: details.operation,
           module: modName,
           moduleBase: modBase.toString(),
           rva: "0x" + rva.toString(16)
         }});
 
-        // periodically flush to Python
-        if (records.length >= 200) {{
-          send({{ type: "chunk", records: records }});
+        if (records.length >= 100) {{
+          send({{type: "chunk", records: records}});
           records = [];
         }}
       }}
@@ -55,67 +55,47 @@ def main():
     rpc.exports = {{
       stop: function() {{
         MemoryAccessMonitor.disable();
-        send({{ type: "chunk", records: records, done: true }});
-        records = [];
+        send({{type: "chunk", records: records, done: true}});
       }}
     }};
     """
 
-    def on_message(message, data):
+    def on_msg(message, data):
         nonlocal all_records
         if message["type"] == "send":
             payload = message["payload"]
             if isinstance(payload, dict) and payload.get("type") == "chunk":
-                all_records.extend(payload.get("records", []))
-            else:
-                print("[JS]", payload)
+                all_records.extend(payload["records"])
         elif message["type"] == "error":
             print("[JS-ERROR]", message)
 
     script = session.create_script(js)
-    script.on("message", on_message)
+    script.on("message", on_msg)
     script.load()
 
-    print(f"[*] MemoryAccessMonitor enabled on 0x{TARGET_ADDR:08X}")
-    print("[*] Now move UP / DOWN / LEFT / RIGHT in EO for about 20–30 seconds.")
-    time.sleep(25)  # give you time to move
+    print("[*] Monitoring REAL movement input region...")
+    time.sleep(RECORD_SECONDS)
 
-    print("[*] Stopping monitor and flushing remaining records...")
+    print("[*] Stopping monitor...")
     script.exports.stop()
-    time.sleep(1.0)
+    session.detach()
 
-    try:
-        session.detach()
-    except Exception:
-        pass
-
-    out_file = "eo_dir821_writes.json"
-    with open(out_file, "w", encoding="utf-8") as f:
+    fname = "eo_real_input_writes.json"
+    with open(fname, "w") as f:
         json.dump(all_records, f, indent=4)
 
-    print(f"\n[done] Saved {len(all_records)} access records to {out_file}")
+    print(f"\n[done] Saved {len(all_records)} writes to {fname}")
 
-    # Summarize *writers* to 0x265c821
-    writer_counts = collections.Counter()
-    for rec in all_records:
-        if rec.get("operation") != "write":
-            continue
-        key = (rec.get("module"), rec.get("rva"))
-        writer_counts[key] += 1
+    # Summarize real writers
+    writers = collections.Counter(
+        (rec["module"], rec["rva"])
+        for rec in all_records
+        if rec["operation"] == "write"
+    )
 
-    if not writer_counts:
-        print("\n[summary] No writes captured to 0x265c821 during this run.")
-        print("          If you definitely saw direction change, this probably means")
-        print("          the address shifted; 0x265c821 was from a previous run.")
-        return
-
-    print("\n[summary] Writers to dir byte (module, RVA -> write count):")
-    for (mod, rva), count in writer_counts.most_common(15):
-        print(f"  {mod or '??'} @ {rva} -> {count} writes")
-
-    print("\nThese RVAs are the exact instructions that update the direction byte.")
-    print("Next step after this: hook the top RVA with Interceptor.attach,")
-    print("log its context (registers/args), and turn it into a callable 'move(dir)'.")
+    print("\n[SUMMARY] REAL INPUT WRITERS:")
+    for (mod, rva), cnt in writers.most_common(10):
+        print(f"  {mod} @ {rva}  -> {cnt} writes")
 
 
 if __name__ == "__main__":
