@@ -1,275 +1,58 @@
 import frida
 import time
-import json
-import pydirectinput
-
-# ============================
-# CONFIG
-# ============================
 
 PROCESS_NAME = "Endless.exe"
-
-# From CeraBot v12.2:
-#   directionalAddress = "0x6DACA"
-# That is the RVA of the MOV instruction that writes character direction.
-DIRECTIONAL_RVA = 0x6DACA
-
-# Scan region around the runtime direction byte address
-PRE_BYTES = 0x200          # bytes before
-SCAN_RANGE = 0x4000        # total bytes in window (wider)
-
-SCAN_DURATION = 1.5        # seconds to hold each direction
-SCAN_INTERVAL = 0.1        # seconds between diff scans
-
-# Real keys, same style as CeraBot (no numpad)
-KEY_UP = "up"
-KEY_RIGHT = "right"
-KEY_DOWN = "down"
-KEY_LEFT = "left"
-
-# pydirectinput config
-pydirectinput.FAILSAFE = False
-pydirectinput.PAUSE = 0.02
-
-# ============================
-# GLOBALS
-# ============================
-
-directional_addr = None
-dir_session = None
-dir_script = None
-dir_resolved = False
+DIRECTIONAL_RVA = 0x6DACA   # Verified from CeraBot v12.2
 
 
-def on_message_directional(message, data):
-    global directional_addr, dir_resolved, dir_session
+def on_message(message, data):
     if message["type"] == "send":
-        payload = message["payload"]
-        if "error" in payload:
-            print("[dir] Error from script:", payload["error"])
-            return
-        addr_str = payload.get("directional_address")
-        val_str = payload.get("value")
-        if addr_str is None:
-            print("[dir] Missing directional_address in payload:", payload)
-            return
-        directional_addr = int(addr_str, 16)
-        print(f"[dir] Found directional byte at {hex(directional_addr)} (initial value={val_str})")
-        dir_resolved = True
-        try:
-            dir_session.detach()
-        except Exception:
-            pass
+        print("[✓]", message["payload"])
     elif message["type"] == "error":
-        print("[dir] Script error:", message)
+        print("[Error]", message)
 
 
-def resolve_directional_addr():
-    global dir_session, dir_script, dir_resolved
+def main():
+    print("=== EO Direction Byte Scanner (Frida 16) ===")
+    print("Attach → Press ANY movement key → Script prints the directional address.")
+    print("\nMake sure Endless.exe is running and your character is in-game.")
+    input("Press Enter to attach...\n")
 
-    print("[dir] Attaching to Endless.exe to resolve directional address via RVA 0x%X..." % DIRECTIONAL_RVA)
-    dir_session = frida.attach(PROCESS_NAME)
+    session = frida.attach(PROCESS_NAME)
 
     js = f"""
-    var mod = null;
-    try {{
-        mod = Process.getModuleByName("{PROCESS_NAME}");
-    }} catch (e) {{
-        var mods = Process.enumerateModules();
-        mod = mods.length ? mods[0] : null;
-    }}
-    if (!mod) {{
-        throw new Error("Could not find module base for {PROCESS_NAME}");
-    }}
+    var base = Process.getModuleByName("{PROCESS_NAME}").base;
+    var inst = base.add({DIRECTIONAL_RVA});   // mov [ebx+55], dl
 
-    var base = mod.base;
-    var rel  = ptr({DIRECTIONAL_RVA});
-    var target = base.add(rel);
-
-    Interceptor.attach(target, {{
+    Interceptor.attach(inst, {{
       onEnter: function(args) {{
         var ebx = this.context.ebx || this.context.rbx;
         if (!ebx) {{
-          send({{ error: "No EBX/RBX in context" }});
+          send("No EBX/RBX — unexpected.");
           return;
         }}
-        var dirAddr = ebx.add(0x55);
-        var val = dirAddr.readU8();
-        send({{
-          directional_address: dirAddr.toString(),
-          value: val.toString()
-        }});
+
+        var directionalAddress = ebx.add(0x55);   // ALWAYS the direction byte
+        var value = directionalAddress.readU8();
+
+        send("directional_address = " 
+            + directionalAddress.toString() 
+            + "   value=" + value);
+
       }}
     }});
     """
 
-    dir_script = dir_session.create_script(js)
-    dir_script.on("message", on_message_directional)
-    dir_script.load()
+    script = session.create_script(js)
+    script.on("message", on_message)
+    script.load()
 
-    print("[dir] Now move your character once in EO to trigger the directional write hook...")
-    while not dir_resolved:
-        time.sleep(0.05)
-    print("[dir] Directional address resolved.")
+    print("Scanner armed. Now ALT-TAB to EO and press ANY direction (W/A/S/D or arrow keys).")
+    print("The moment you move, your real directional address will appear above.\n")
 
-
-def start_scanner():
-    if directional_addr is None:
-        raise RuntimeError("directional_addr is not resolved; run resolve_directional_addr() first.")
-
-    scan_session = frida.attach(PROCESS_NAME)
-
-    js = f"""
-    var dirPtr = ptr("{hex(directional_addr)}");
-    var start = dirPtr.sub({PRE_BYTES});
-    var size = {SCAN_RANGE};
-
-    function takeSnapshot() {{
-        var out = {{}};
-        for (var i = 0; i < size; i++) {{
-            out[i] = Memory.readU8(start.add(i));
-        }}
-        return out;
-    }}
-
-    var baseline = null;
-
-    rpc.exports = {{
-        baseline: function() {{
-            baseline = takeSnapshot();
-        }},
-        diffscan: function() {{
-            if (baseline === null) {{
-                baseline = takeSnapshot();
-            }}
-            var now = takeSnapshot();
-            var changed = [];
-            for (var i = 0; i < size; i++) {{
-                if (now[i] !== baseline[i]) changed.push(i);
-            }}
-            return changed;
-        }},
-        readbyte: function() {{
-            return Memory.readU8(dirPtr);
-        }}
-    }};
-    """
-
-    scan_script = scan_session.create_script(js)
-    scan_script.load()
-    print("[scan] Scanner script loaded (around directional byte).")
-    return scan_session, scan_script
-
-
-def hold_and_scan(label, key, scan_script, duration=1.5, interval=0.1):
-    """
-    Hold a real key (via pydirectinput) and repeatedly:
-      - diffscan vs baseline
-      - read the directional byte
-    Returns:
-      (set_of_offsets, list_of_values)
-    """
-    print(f"[scan] Auto-moving {label.upper()} using key '{key}' for {duration:.1f}s...")
-    offsets = set()
-    values = []
-
-    pydirectinput.keyDown(key)
-    start = time.time()
-    try:
-        while time.time() - start < duration:
-            try:
-                val = scan_script.exports.readbyte()
-                values.append(int(val))
-            except Exception:
-                pass
-            try:
-                changed = scan_script.exports.diffscan()
-                if changed:
-                    offsets.update(changed)
-            except Exception:
-                pass
-            time.sleep(interval)
-    finally:
-        pydirectinput.keyUp(key)
-
-    print(f"[scan] {label.upper()} collected {len(offsets)} offsets, observed values: {sorted(set(values))}")
-    return offsets, values
-
-
-def main():
-    print("=== EO Direction Scanner (Frida 16 + pydirectinput, using RVA + widened scan) ===")
-    print("Make sure Endless.exe is running and your character is in-game.")
-    input("Press Enter here, then alt-tab to EO and be ready to move once...")
-
-    # 1) Resolve directional_addr using the known RVA from CeraBot
-    resolve_directional_addr()
-    print(f"[main] Using directional byte address = {hex(directional_addr)}")
-    print(f"[main] Scan window: {hex(PRE_BYTES)} bytes before, total {hex(SCAN_RANGE)} bytes.")
-
-    # 2) Start scanner
-    scan_session, scan_script = start_scanner()
-
-    # 3) Capture idle baseline
-    print("[scan] Stand completely still in EO. Baseline will be captured in 5 seconds...")
-    time.sleep(5.0)
-    scan_script.exports.baseline()
-    print("[scan] Baseline captured.")
-    print("[scan] Script will now auto-move in each direction with real arrow keys (no numpad).")
-    print("       Click the EO window now and then do NOT touch keyboard/mouse.")
-    time.sleep(3.0)
-
-    results_offsets = {}
-    results_values = {}
-
-    # UP
-    offs_up, vals_up = hold_and_scan("up", KEY_UP, scan_script, duration=SCAN_DURATION, interval=SCAN_INTERVAL)
-    results_offsets["up"] = offs_up
-    results_values["up"] = sorted(set(vals_up))
-
-    # RIGHT
-    offs_right, vals_right = hold_and_scan("right", KEY_RIGHT, scan_script, duration=SCAN_DURATION, interval=SCAN_INTERVAL)
-    results_offsets["right"] = offs_right
-    results_values["right"] = sorted(set(vals_right))
-
-    # DOWN
-    offs_down, vals_down = hold_and_scan("down", KEY_DOWN, scan_script, duration=SCAN_DURATION, interval=SCAN_INTERVAL)
-    results_offsets["down"] = offs_down
-    results_values["down"] = sorted(set(vals_down))
-
-    # LEFT
-    offs_left, vals_left = hold_and_scan("left", KEY_LEFT, scan_script, duration=SCAN_DURATION, interval=SCAN_INTERVAL)
-    results_offsets["left"] = offs_left
-    results_values["left"] = sorted(set(vals_left))
-
-    # 4) Convert offsets to absolute addresses, NO filtering
-    base_start = directional_addr - PRE_BYTES
-    results_abs = {
-        direction: [hex(base_start + off) for off in sorted(offsets)]
-        for direction, offsets in results_offsets.items()
-    }
-
-    output = {
-        "directional_address": hex(directional_addr),
-        "values": results_values,
-        "raw_addresses": results_abs
-    }
-
-    outfile = "eo_direction_scan.json"
-    with open(outfile, "w", encoding="utf-8") as f:
-        json.dump(output, f, indent=4)
-
-    print(f"\n[done] Saved directional scan data to {outfile}")
-    print(json.dumps(output, indent=4))
-
-    # Cleanup
-    try:
-        scan_session.detach()
-    except Exception:
-        pass
-    try:
-        dir_session.detach()
-    except Exception:
-        pass
+    # keep the script alive
+    while True:
+        time.sleep(0.2)
 
 
 if __name__ == "__main__":
