@@ -1,29 +1,19 @@
+import frida
 import time
 import json
-import frida
 
 # ============================
 # CONFIG
 # ============================
 
-# From your script
-WALK_ADDRESS = "0xEEC70"   # walk function RVA from Endless.exe
-DIRECTIONAL_RVA = 0x6DACA  # directionalAddress from your script
-
-PRE_BYTES = 0x200          # bytes before X address to include in scan window
-SCAN_RANGE = 0x400         # total scan window size in bytes
-
-# Assumed mapping of directional byte -> direction name
-# Adjust if needed after you see results.
-DIR_MAPPING = {
-    0: "up",
-    1: "right",
-    2: "down",
-    3: "left",
-}
+WALK_ADDRESS = "0xEEC70"       # from your script
+DIRECTIONAL_RVA = 0x6DACA      # directionalAddress (to detect direction)
+RECORD_SECONDS = 20.0          # how long to record movement
+PRE_BYTES = 0x200
+SCAN_RANGE = 0x400
 
 # ============================
-# GLOBAL STATE
+# GLOBALS
 # ============================
 
 x_address = None
@@ -36,119 +26,82 @@ xy_script = None
 scan_session = None
 scan_script = None
 
-# store offsets (ints relative to scan window); convert to abs later
-offset_results = {
-    "up": set(),
-    "down": set(),
-    "left": set(),
-    "right": set(),
-}
+# changed offsets → later converted to absolute addresses
+changed_offsets = set()
 
 # ============================
-# XY RESOLVER (Frida hook, same pattern as your bot)
+# FRIDA HOOK — Resolve X/Y
 # ============================
 
 def on_message_xy(message, data):
-    """
-    Frida message handler to capture dynamic X/Y addresses when the walk
-    function executes once.
-    """
     global xstarted, x_address, y_address, xy_session
 
     if message["type"] == "send":
         payload = message["payload"]
         if "error" in payload:
-            print("[frida][xy] error from script:", payload["error"])
+            print("[frida][xy][error]", payload["error"])
             return
 
         x_address = int(payload["x_address"], 16)
         y_address = int(payload["y_address"], 16)
-        print(f"[frida][xy] X={hex(x_address)}, Y={hex(y_address)}")
+        print(f"[xy] X={hex(x_address)}, Y={hex(y_address)}")
 
         xstarted = 1
-
-        # Detach this session once we have X/Y, no need to keep hook active
         try:
             xy_session.detach()
-        except Exception:
+        except:
             pass
 
     elif message["type"] == "error":
-        print("[frida][xy] script error:", message.get("stack", message))
+        print("[frida][xy][script error]", message)
 
 
-def start_frida_session_xy(walk_address: str):
-    """
-    Attach to Endless.exe and hook the walk function at WALK_ADDRESS
-    to resolve the dynamic X/Y addresses (same logic as your bot).
-    """
+def start_frida_session_xy():
     global xy_session, xy_script, xstarted
 
-    xstarted = 0
     xy_session = frida.attach("Endless.exe")
-    print("[xy] Attached to Endless.exe, waiting for movement hook...")
+    print("[xy] Attached, waiting for player movement hook...")
 
-    # Inline JS, uses WALK_ADDRESS as an RVA from module base
-    script_code = """
-    var mod = null;
-    try {
-      mod = Process.getModuleByName("Endless.exe");
-    } catch (e) {
-      var mods = Process.enumerateModules();
-      mod = mods.length ? mods[0] : null;
-    }
-    if (!mod) {
-      throw new Error("Could not find module base for Endless.exe");
-    }
+    js = """
+    var mod = Process.getModuleByName("Endless.exe");
     var base = mod.base;
-    var rel = ptr(%d);
-    var target = base.add(rel);
+    var target = base.add(%d);
 
     Interceptor.attach(target, {
-      onEnter: function(args) {
-        var reg = this.context.ecx || this.context.rcx;
-        if (!reg) {
-          send({ error: "No ECX/RCX in context" });
-          return;
-        }
-        var xAddress = reg.add(0x08);
-        var yAddress = xAddress.add(0x04);
-        send({
-          x_address: xAddress.toString(),
-          y_address: yAddress.toString()
-        });
-      }
-    });
-    """ % int(walk_address, 16)
+        onEnter: function(args) {
+            var reg = this.context.ecx || this.context.rcx;
+            if (!reg) {
+                send({error: "No ECX/RCX"});
+                return;
+            }
+            var xAddress = reg.add(0x08);
+            var yAddress = xAddress.add(0x04);
 
-    xy_script = xy_session.create_script(script_code)
+            send({
+                x_address: xAddress.toString(),
+                y_address: yAddress.toString()
+            });
+        }
+    });
+    """ % int(WALK_ADDRESS, 16)
+
+    xy_script = xy_session.create_script(js)
     xy_script.on("message", on_message_xy)
     xy_script.load()
 
-    print("[xy] Now move your character once in-game to trigger the walk hook...")
-
-    # Block until we have X/Y
+    # Wait until player moves once
     while xstarted == 0:
         time.sleep(0.01)
 
-    print("[xy] X/Y resolved.")
+    print("[xy] X/Y resolved successfully.")
 
 
 # ============================
-# MEMORY SCANNER (Frida RPC)
+# FRIDA MEMORY RECORDER
 # ============================
 
 SCAN_JS_TEMPLATE = """
-var mod = null;
-try {
-  mod = Process.getModuleByName("Endless.exe");
-} catch (e) {
-  var mods = Process.enumerateModules();
-  mod = mods.length ? mods[0] : null;
-}
-if (!mod) {
-  throw new Error("Could not find Endless.exe module");
-}
+var mod = Process.getModuleByName("Endless.exe");
 var base = mod.base;
 var dirPtr = base.add(%d);
 
@@ -156,139 +109,119 @@ var xPtr = ptr("%s");
 var start = xPtr.sub(%d);
 var size = %d;
 
-function takeSnapshot() {
-  var out = {};
-  for (var i = 0; i < size; i++) {
-    out[i] = Memory.readU8(start.add(i));
-  }
-  return out;
+function takeSnap() {
+    var out = {};
+    for (var i = 0; i < size; i++) {
+        out[i] = Memory.readU8(start.add(i));
+    }
+    return out;
 }
 
 var baseline = null;
 
 rpc.exports = {
-  resetbaseline: function() {
-    baseline = takeSnapshot();
-  },
-  diffscan: function() {
-    if (baseline === null) {
-      baseline = takeSnapshot();
+    idle: function() {
+        baseline = takeSnap();
+    },
+    diff: function() {
+        var now = takeSnap();
+        var c = [];
+        for (var i = 0; i < size; i++) {
+            if (now[i] !== baseline[i]) c.push(i);
+        }
+        return c;
+    },
+    readdir: function() {
+        return Memory.readU8(dirPtr);
     }
-    var now = takeSnapshot();
-    var changed = [];
-    for (var i = 0; i < size; i++) {
-      if (now[i] !== baseline[i]) {
-        changed.push(i);
-      }
-    }
-    return changed;
-  },
-  readdirection: function() {
-    return Memory.readU8(dirPtr);
-  }
 };
 """
 
 
-def start_scanner_session():
-    """
-    Attach a fresh Frida session that exposes:
-      - resetbaseline(): capture idle snapshot
-      - diffscan(): offsets that differ from baseline
-      - readdirection(): current value of directionalAddress
-    """
+def start_recorder():
     global scan_session, scan_script
 
-    if x_address is None:
-        raise RuntimeError("x_address is not set; run XY hook first.")
-
     scan_session = frida.attach("Endless.exe")
-    js = SCAN_JS_TEMPLATE % (DIRECTIONAL_RVA, hex(x_address), PRE_BYTES, SCAN_RANGE)
+
+    js = SCAN_JS_TEMPLATE % (
+        DIRECTIONAL_RVA,
+        hex(x_address),
+        PRE_BYTES,
+        SCAN_RANGE
+    )
+
     scan_script = scan_session.create_script(js)
     scan_script.load()
-    print("[scan] Scanner script loaded.")
 
-    # Ask user to stand still, then capture baseline automatically
-    print("\n[scan] Stand still in-game (no movement).")
-    print("[scan] Capturing idle baseline in 5 seconds...")
-    time.sleep(5.0)
-    scan_script.exports.resetbaseline()
-    print("[scan] Idle baseline captured.")
+    print("[rec] Stand still, capturing idle baseline in 5 seconds...")
+    time.sleep(5)
+    scan_script.exports.idle()
+    print("[rec] Baseline captured.")
 
 
-def auto_record(total_seconds=20.0, interval=0.1):
-    """
-    Auto-record loop:
-      - For total_seconds, repeatedly:
-        - read directionalAddress
-        - diff vs baseline
-        - bucket offsets by direction according to DIR_MAPPING
-    You: in Endless, just keep cycling Up -> Right -> Down -> Left.
-    """
-    end_time = time.time() + total_seconds
-    print(f"\n[rec] Auto-recording for {total_seconds} seconds.")
-    print("[rec] In Endless, repeatedly move UP, RIGHT, DOWN, LEFT in a loop while this runs.")
-    print("[rec] Example: Up 1–2s, Right 1–2s, Down 1–2s, Left 1–2s, repeat...")
+def record_changes():
+    global changed_offsets
 
-    while time.time() < end_time:
-        try:
-            dir_val = scan_script.exports.readdirection()
-            changed = scan_script.exports.diffscan()
-        except Exception as e:
-            print("[rec] Error during record:", e)
-            break
+    print(f"[rec] Recording for {RECORD_SECONDS} seconds...")
+    end = time.time() + RECORD_SECONDS
+    while time.time() < end:
+        offs = scan_script.exports.diff()
+        if offs:
+            changed_offsets.update(offs)
+        time.sleep(0.05)
 
-        if not changed:
-            time.sleep(interval)
-            continue
-
-        dir_name = DIR_MAPPING.get(dir_val)
-        if dir_name is None:
-            # Unknown direction code; skip
-            time.sleep(interval)
-            continue
-
-        offset_results[dir_name].update(changed)
-        time.sleep(interval)
-
-    print("[rec] Recording window complete.")
+    print("[rec] Recording finished.")
+    print(f"[rec] {len(changed_offsets)} offsets changed.")
 
 
 # ============================
-# FILTERING HELPERS
+# FRIDA WRITE TRACER
 # ============================
 
-def compute_absolute_results():
+def trace_addresses(abs_addresses):
     """
-    Convert offset_results into:
-      - raw absolute addresses
-      - unique absolute addresses (best guesses)
+    For each absolute address, attach an Interceptor to log writes.
     """
-    base_start = x_address - PRE_BYTES
+    print("[trace] Attaching write hooks...")
 
-    # raw absolute addresses
-    raw_abs = {
-        d: [hex(base_start + off) for off in sorted(list(offset_results[d]))]
-        for d in offset_results
-    }
+    trace_script_js = "var hooks = [];\n"
 
-    # unique per-direction: changed for that direction, not for the others
-    sets = {d: set(offset_results[d]) for d in offset_results}
-    unique_offsets = {}
-    for d in sets:
-        others = set()
-        for od in sets:
-            if od == d:
-                continue
-            others |= sets[od]
-        unique_offsets[d] = sets[d] - others
+    for addr in abs_addresses:
+        trace_script_js += f"""
+        var a{addr.replace("0x","")} = ptr("{addr}");
+        hooks.push(Interceptor.attach(a{addr.replace("0x","")}, {{
+            onWrite: function(args) {{
+                send({{
+                    written_to: "{addr}",
+                    ip: this.context.rip ? this.context.rip.toString() : this.context.eip.toString(),
+                    regs: {{
+                        rcx: this.context.rcx,
+                        rdx: this.context.rdx,
+                        rbx: this.context.rbx,
+                        rax: this.context.rax
+                    }}
+                }});
+            }}
+        }}));
+        """
 
-    unique_abs = {
-        d: [hex(base_start + off) for off in sorted(list(unique_offsets[d]))]
-        for d in unique_offsets
-    }
+    trace_session = frida.attach("Endless.exe")
+    trace_script = trace_session.create_script(trace_script_js)
 
-    return raw_abs, unique_abs
+    events = []
+
+    def on_trace_msg(message, data):
+        if message["type"] == "send":
+            events.append(message["payload"])
+
+    trace_script.on("message", on_trace_msg)
+    trace_script.load()
+
+    print("[trace] Now move around for ~10 seconds to trigger writes...")
+    time.sleep(10)
+
+    trace_session.detach()
+    return events
 
 
 # ============================
@@ -296,44 +229,34 @@ def compute_absolute_results():
 # ============================
 
 def main():
-    print("=== EO Movement Flag Scanner (Frida 16, AUTO RECORD) ===")
-    print("Make sure Endless.exe is running and your character is in-game.")
+    print("=== EO Movement Scanner + Write Tracer ===\n")
 
-    # 1) Resolve X/Y via walk hook
-    start_frida_session_xy(WALK_ADDRESS)
-    print(f"[main] Using resolved X={hex(x_address)}, Y={hex(y_address)}")
+    # 1. Resolve X/Y
+    start_frida_session_xy()
 
-    # 2) Start scanner + idle baseline
-    start_scanner_session()
+    # 2. Start recorder
+    start_recorder()
 
-    # 3) Auto record while you move around
-    auto_record(total_seconds=20.0, interval=0.1)
+    # 3. Auto-record
+    record_changes()
 
-    # 4) Compute and save results
-    raw_abs, unique_abs = compute_absolute_results()
-    data = {
-        "raw": raw_abs,
-        "unique": unique_abs,
-    }
+    # 4. Convert changed offsets → absolute addresses
+    base = x_address - PRE_BYTES
+    absolute_addresses = [hex(base + off) for off in changed_offsets]
 
-    filename = "movement_addresses.json"
-    with open(filename, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=4)
+    with open("movement_raw.json", "w") as f:
+        json.dump({"raw_addresses": absolute_addresses}, f, indent=4)
 
-    print(f"\n[done] Saved movement addresses to {filename}")
-    print(json.dumps(data, indent=4))
+    print(f"\n[save] Saved {len(absolute_addresses)} raw addresses to movement_raw.json")
 
-    # 5) Clean up sessions
-    if scan_session is not None:
-        try:
-            scan_session.detach()
-        except Exception:
-            pass
-    if xy_session is not None:
-        try:
-            xy_session.detach()
-        except Exception:
-            pass
+    # 5. Trace writes to those addresses
+    events = trace_addresses(absolute_addresses)
+
+    with open("movement_writes.json", "w") as f:
+        json.dump(events, f, indent=4)
+
+    print("[save] Write trace saved to movement_writes.json")
+    print("[done] Complete.\n")
 
 
 if __name__ == "__main__":
