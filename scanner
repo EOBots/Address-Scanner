@@ -1,312 +1,130 @@
-import frida
 import time
 import json
-import ctypes
+import pymem
+import pymem.process
+import pydirectinput
 
-# ============================
-# CONFIG
-# ============================
 
 PROCESS_NAME = "Endless.exe"
+OUTPUT_FILE = "eo_movement_addresses.json"
 
-# From your bot:
-WALK_ADDRESS = "0xEEC70"   # RVA of walk/move function from Endless.exe
-
-# Scan window around the player X address
-PRE_BYTES = 0x200          # bytes before X address to include
-SCAN_RANGE = 0x400         # total bytes in window
-
-# Virtual-key codes (main keyboard, not numpad)
-VK_UP    = 0x26
-VK_DOWN  = 0x28
-VK_LEFT  = 0x25
-VK_RIGHT = 0x27
-
-VK_W = 0x57
-VK_A = 0x41
-VK_S = 0x53
-VK_D = 0x44
-
-KEYEVENTF_KEYUP = 0x0002
-
-user32 = ctypes.WinDLL('user32', use_last_error=True)
+# Configure pydirectinput similar to CeraBot usage
+pydirectinput.FAILSAFE = False
+pydirectinput.PAUSE = 0.02
 
 
-def key_down(vk):
-    user32.keybd_event(vk, 0, 0, 0)
-
-
-def key_up(vk):
-    user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
-
-
-def hold_keys_and_scan(label, keys, script, duration=1.5, interval=0.1):
-    """
-    Hold multiple keys for `duration` seconds, repeatedly calling diffscan()
-    and unioning all changed offsets. Returns a set of offsets.
-    """
-    changed_offsets = set()
-    print(f"[scan] Auto-moving {label.upper()} for {duration:.1f}s...")
-
-    # Press all keys down
-    for vk in keys:
-        key_down(vk)
-
-    start = time.time()
+def attach_process(name: str) -> pymem.Pymem:
     try:
-        while time.time() - start < duration:
-            offs = script.exports.diffscan()
-            if offs:
-                changed_offsets.update(offs)
-            time.sleep(interval)
-    finally:
-        # Release all keys
-        for vk in keys:
-            key_up(vk)
-
-    print(f"[scan] {label.upper()} collected {len(changed_offsets)} offsets.")
-    return changed_offsets
+        pm = pymem.Pymem(name)
+        return pm
+    except pymem.exception.ProcessNotFound:
+        raise SystemExit(f"[!] Could not find process '{name}'. Make sure EO is running.")
+    except Exception as e:
+        raise SystemExit(f"[!] Failed to attach to '{name}': {e}")
 
 
-# ============================
-# XY RESOLVER (same pattern as CeraBot)
-# ============================
-
-x_address = None
-y_address = None
-xy_session = None
-xy_script = None
-x_started = False
+def get_main_module(pm: pymem.Pymem):
+    try:
+        module = pymem.process.module_from_name(pm.process_handle, PROCESS_NAME)
+        return module
+    except Exception as e:
+        raise SystemExit(f"[!] Failed to resolve main module: {e}")
 
 
-def on_message_xy(message, data):
+def read_module_bytes(pm: pymem.Pymem, base: int, size: int) -> bytes:
+    try:
+        return pm.read_bytes(base, size)
+    except Exception as e:
+        raise SystemExit(f"[!] Failed to read module memory: {e}")
+
+
+def hold_key(key: str, duration: float = 0.4):
     """
-    Frida message handler to capture dynamic X/Y addresses when the walk
-    function executes once.
+    Hold a *real* movement key like CeraBot does.
+    Valid keys here: 'up', 'down', 'left', 'right' (or WASD if you change it).
     """
-    global x_address, y_address, xy_session, x_started
-
-    if message["type"] == "send":
-        payload = message["payload"]
-        if "error" in payload:
-            print("[xy] Error from script:", payload["error"])
-            return
-
-        x_address = int(payload["x_address"], 16)
-        y_address = int(payload["y_address"], 16)
-        print(f"[xy] Resolved X={hex(x_address)}, Y={hex(y_address)}")
-
-        x_started = True
-
-        # Done with this hook — detach XY session
-        try:
-            xy_session.detach()
-        except Exception:
-            pass
-
-    elif message["type"] == "error":
-        print("[xy] Script error:", message)
+    pydirectinput.keyDown(key)
+    time.sleep(duration)
+    pydirectinput.keyUp(key)
 
 
-def resolve_xy():
+def capture_state(pm: pymem.Pymem, base: int, size: int) -> bytes:
+    # Small delay to let the game settle
+    time.sleep(0.05)
+    return read_module_bytes(pm, base, size)
+
+
+def scan_differences(idle: bytes, states: dict, base: int, step: int = 4) -> dict:
     """
-    Attach to Endless.exe, hook WALK_ADDRESS, and grab X/Y from ECX/RCX
-    when the client runs its own movement logic once.
+    Compare 4-byte chunks across snapshots and record addresses whose value
+    differs from idle for each direction.
     """
-    global xy_session, xy_script, x_started
+    size = min(len(idle), *[len(b) for b in states.values()])
+    result = {k: [] for k in states.keys()}
 
-    print("[xy] Attaching to Endless.exe to resolve X/Y...")
-    xy_session = frida.attach(PROCESS_NAME)
+    mv_idle = memoryview(idle)
+    mv_states = {k: memoryview(v) for k, v in states.items()}
 
-    js = f"""
-    var mod;
-    try {{
-        mod = Process.getModuleByName("{PROCESS_NAME}");
-    }} catch (e) {{
-        var mods = Process.enumerateModules();
-        mod = mods.length ? mods[0] : null;
-    }}
-    if (!mod) {{
-        throw new Error("Could not find {PROCESS_NAME} module");
-    }}
+    for offset in range(0, size - 4, step):
+        v_idle = mv_idle[offset:offset + 4]
 
-    var base = mod.base;
-    var rel = ptr({int(WALK_ADDRESS, 16)});
-    var target = base.add(rel);
+        for name, mv in mv_states.items():
+            v_dir = mv[offset:offset + 4]
+            if v_dir != v_idle:
+                addr = base + offset
+                result[name].append(hex(addr))
 
-    Interceptor.attach(target, {{
-        onEnter: function(args) {{
-            var reg = this.context.ecx || this.context.rcx;
-            if (!reg) {{
-                send({{ error: "No ECX/RCX in context" }});
-                return;
-            }}
-            var xAddress = reg.add(0x08);
-            var yAddress = xAddress.add(0x04);
-            send({{
-                x_address: xAddress.toString(),
-                y_address: yAddress.toString()
-            }});
-        }}
-    }});
-    """
+    return result
 
-    xy_script = xy_session.create_script(js)
-    xy_script.on("message", on_message_xy)
-    xy_script.load()
-
-    print("[xy] Now move your character once in Endless Online to trigger hook...")
-
-    # Wait until we get X/Y once
-    while not x_started:
-        time.sleep(0.05)
-
-    print("[xy] X/Y resolved.")
-
-
-# ============================
-# SCANNER (Frida RPC)
-# ============================
-
-def start_scanner():
-    """
-    Attach a fresh Frida session that exposes:
-      - resetbaseline(): capture idle snapshot
-      - diffscan(): offsets that differ from baseline
-    """
-    if x_address is None:
-        raise RuntimeError("x_address is not resolved.")
-
-    print("[scan] Attaching scanner to Endless.exe...")
-    scan_session = frida.attach(PROCESS_NAME)
-
-    js = f"""
-    var xPtr = ptr("{hex(x_address)}");
-    var start = xPtr.sub({PRE_BYTES});
-    var size = {SCAN_RANGE};
-
-    function takeSnapshot() {{
-        var out = {{}};
-        for (var i = 0; i < size; i++) {{
-            out[i] = Memory.readU8(start.add(i));
-        }}
-        return out;
-    }}
-
-    var baseline = null;
-
-    rpc.exports = {{
-        resetbaseline: function() {{
-            baseline = takeSnapshot();
-        }},
-        diffscan: function() {{
-            if (baseline === null) {{
-                baseline = takeSnapshot();
-            }}
-            var now = takeSnapshot();
-            var changed = [];
-            for (var i = 0; i < size; i++) {{
-                if (now[i] !== baseline[i]) changed.push(i);
-            }}
-            return changed;
-        }}
-    }};
-    """
-
-    scan_script = scan_session.create_script(js)
-    scan_script.load()
-    print("[scan] Scanner loaded.")
-    return scan_session, scan_script
-
-
-# ============================
-# MAIN
-# ============================
 
 def main():
-    print("=== EO Arrow/WASD Input Scanner (Frida 16, auto-move, NO filtering) ===")
-    print("Make sure Endless.exe is running and your character is in-game.")
-    input("Press Enter here, then switch to Endless and be ready to move once...")
+    print("[*] Attaching to Endless Online...")
+    pm = attach_process(PROCESS_NAME)
+    module = get_main_module(pm)
+    base = module.lpBaseOfDll
+    size = module.SizeOfImage
 
-    # 1) Resolve X/Y via existing walk hook logic
-    resolve_xy()
-    print(f"[main] Using X address = {hex(x_address)} "
-          f"(scan window {hex(PRE_BYTES)} bytes before, {hex(SCAN_RANGE)} bytes total).")
+    print(f"[*] Attached to {PROCESS_NAME} at 0x{base:X}, size 0x{size:X}")
 
-    # 2) Start scanner
-    scan_session, scan_script = start_scanner()
-
-    # 3) Capture idle baseline
-    print("[scan] Stand completely still in-game. Baseline will be captured in 5 seconds...")
+    print("\n>>> IMPORTANT <<<")
+    print("1) Put your character in a safe place (no monsters, no dialogue).")
+    print("2) Focus the Endless Online window.")
+    print("3) Do NOT touch keyboard/mouse once scanning starts.")
+    print("You have 5 seconds to alt-tab to EO...")
     time.sleep(5.0)
-    scan_script.exports.resetbaseline()
-    print("[scan] Baseline captured.")
-    print("[scan] Script will now auto-move in each direction.")
-    print("       Make sure the Endless Online window is focused (click it) now.")
-    time.sleep(3.0)  # small delay so you can click EO window
 
-    # 4) Auto-move each direction and record all changed offsets (NO filtering)
-    results_offsets = {}
+    print("[*] Capturing idle state...")
+    idle = capture_state(pm, base, size)
 
-    # UP  => Arrow Up + W
-    results_offsets["up"] = hold_keys_and_scan(
-        "up",
-        keys=[VK_UP, VK_W],
-        script=scan_script,
-        duration=1.5,
-        interval=0.1
-    )
+    directions = [
+        ("up", "up"),
+        ("down", "down"),
+        ("left", "left"),
+        ("right", "right"),
+    ]
 
-    # RIGHT => Arrow Right + D
-    results_offsets["right"] = hold_keys_and_scan(
-        "right",
-        keys=[VK_RIGHT, VK_D],
-        script=scan_script,
-        duration=1.5,
-        interval=0.1
-    )
+    states = {}
 
-    # DOWN => Arrow Down + S
-    results_offsets["down"] = hold_keys_and_scan(
-        "down",
-        keys=[VK_DOWN, VK_S],
-        script=scan_script,
-        duration=1.5,
-        interval=0.1
-    )
+    for label, key in directions:
+        print(f"[*] Moving {label} (sending real arrow key: {key})...")
+        # Hold key briefly, capture, then release
+        pydirectinput.keyDown(key)
+        time.sleep(0.15)
+        snap = capture_state(pm, base, size)
+        pydirectinput.keyUp(key)
 
-    # LEFT => Arrow Left + A
-    results_offsets["left"] = hold_keys_and_scan(
-        "left",
-        keys=[VK_LEFT, VK_A],
-        script=scan_script,
-        duration=1.5,
-        interval=0.1
-    )
+        states[label] = snap
+        time.sleep(0.5)  # let game settle between moves
 
-    # 5) Convert offsets to absolute addresses, NO filtering
-    base_start = x_address - PRE_BYTES
-    results_abs = {
-        direction: [hex(base_start + off) for off in sorted(offsets)]
-        for direction, offsets in results_offsets.items()
-    }
+    print("[*] Scanning for differences...")
+    result = scan_differences(idle, states, base, step=4)
 
-    outfile = "eo_input_addresses.json"
-    with open(outfile, "w", encoding="utf-8") as f:
-        json.dump(results_abs, f, indent=4)
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=4)
 
-    print(f"\n[done] Saved raw addresses (NO filtering) to {outfile}")
-    print(json.dumps(results_abs, indent=4))
-
-    # 6) Cleanup
-    try:
-        scan_session.detach()
-    except Exception:
-        pass
-    try:
-        xy_session.detach()
-    except Exception:
-        pass
+    print(f"[+] Scan complete. Candidate addresses saved to {OUTPUT_FILE}")
+    for k, v in result.items():
+        print(f"  {k}: {len(v)} addresses")
 
 
 if __name__ == "__main__":
